@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=Centurion
+Comment=Local Codex agent orchestration workspace
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/centurion.exe %u
+Terminal=false
+Type=Application
+Icon=centurion.exe
+Categories=Utility;
+StartupWMClass=centurion.exe
+
+ 

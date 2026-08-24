@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg">
+  <path d="M128 190L512 80L896 190V840L512 950L128 840Z" fill="#07132B" stroke="#061026" stroke-width="34" stroke-linejoin="round"/>
+  <path d="M157 222L512 120L867 222V808L512 904L157 808Z" fill="none" stroke="#16D7F0" stroke-width="22" stroke-linejoin="round"/>
+  <path d="M770 300H450L330 420V604L450 724H770L850 644H530L490 684H476L410 618V406L476 340H490L530 380H850Z" fill="#1765F0"/>
+</svg>
