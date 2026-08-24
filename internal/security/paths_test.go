@@ -11,7 +11,11 @@ func TestValidateArtifactPathBlocksTraversal(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, "artifacts", "result.json")
 	outside := filepath.Join(filepath.Dir(root), "outside.json")
-	if got, err := ValidateArtifactPath(inside, []string{root}); err != nil || got != inside {
+	expectedInside, err := NormalizePath(inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ValidateArtifactPath(inside, []string{root}); err != nil || got != expectedInside {
 		t.Fatalf("expected path inside workspace, got %q, %v", got, err)
 	}
 	if _, err := ValidateArtifactPath(outside, []string{root}); err == nil {

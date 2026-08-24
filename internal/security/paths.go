@@ -66,7 +66,8 @@ func IsWithinRoots(path string, roots []string) bool {
 		if relErr != nil {
 			continue
 		}
-		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+		rel = filepath.ToSlash(rel)
+		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, "../")) {
 			return true
 		}
 	}

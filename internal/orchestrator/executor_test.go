@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/RuanFernandes/centurion/internal/model"
+	"github.com/RuanFernandes/centurion/internal/security"
 )
 
 func TestRuntimeEnforcesTurnLimits(t *testing.T) {
@@ -113,11 +114,19 @@ func TestEffectiveAgentRootsStayInsideProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	outsideRoot := t.TempDir()
+	expectedProjectRoot, err := security.NormalizePath(projectRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedServiceRoot, err := security.NormalizePath(serviceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	if got := effectiveAgentRoots([]string{outsideRoot}, []string{projectRoot}); len(got) != 1 || got[0] != projectRoot {
+	if got := effectiveAgentRoots([]string{outsideRoot}, []string{projectRoot}); len(got) != 1 || got[0] != expectedProjectRoot {
 		t.Fatalf("outside agent root should fall back to project root: %#v", got)
 	}
-	if got := effectiveAgentRoots([]string{serviceRoot}, []string{projectRoot}); len(got) != 1 || got[0] != serviceRoot {
+	if got := effectiveAgentRoots([]string{serviceRoot}, []string{projectRoot}); len(got) != 1 || got[0] != expectedServiceRoot {
 		t.Fatalf("nested agent root should narrow project scope: %#v", got)
 	}
 }
