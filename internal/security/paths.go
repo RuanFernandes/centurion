@@ -19,16 +19,35 @@ func NormalizePath(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve path: %w", err)
 	}
-	abs = filepath.Clean(abs)
-	if info, statErr := os.Stat(abs); statErr == nil {
-		if real, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
-			abs = filepath.Clean(real)
+	return resolvePathWithExistingParent(filepath.Clean(abs))
+}
+
+func resolvePathWithExistingParent(path string) (string, error) {
+	current := filepath.Clean(path)
+	var unresolved []string
+
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, evalErr := filepath.EvalSymlinks(current)
+			if evalErr != nil {
+				return "", fmt.Errorf("resolve symlinks: %w", evalErr)
+			}
+			resolved = filepath.Clean(resolved)
+			for index := len(unresolved) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, unresolved[index])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("inspect path: %w", err)
 		}
-		if !info.IsDir() {
-			return "", fmt.Errorf("workspace root is not a directory: %s", abs)
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return current, nil
 		}
+		unresolved = append(unresolved, filepath.Base(current))
+		current = parent
 	}
-	return abs, nil
 }
 
 func NormalizeRoots(roots []string) ([]string, error) {
@@ -41,6 +60,13 @@ func NormalizeRoots(roots []string) ([]string, error) {
 		normalized, err := NormalizePath(root)
 		if err != nil {
 			return nil, err
+		}
+		info, err := os.Stat(normalized)
+		if err != nil {
+			return nil, fmt.Errorf("inspect workspace root: %w", err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("workspace root is not a directory: %s", normalized)
 		}
 		key := strings.ToLower(normalized)
 		if _, ok := seen[key]; ok {
