@@ -22,6 +22,11 @@ type AgentSession struct {
 	LastActivityAt time.Time
 }
 
+type SessionStats struct {
+	Active int
+	Max    int
+}
+
 type SessionManager struct {
 	mu          sync.Mutex
 	sessions    map[string]AgentSession
@@ -110,4 +115,13 @@ func (m *SessionManager) MaxActive() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.maxActive
+}
+
+func (m *SessionManager) Stats() SessionStats {
+	if m == nil {
+		return SessionStats{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return SessionStats{Active: m.active, Max: m.maxActive}
 }

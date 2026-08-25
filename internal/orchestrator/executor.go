@@ -18,6 +18,10 @@ import (
 
 type ApprovalRequester func(context.Context, model.ApprovalRequest) (bool, error)
 
+const defaultPromptTokenBudget = 12000
+
+var ErrPromptBudgetExceeded = errors.New("workflow prompt token budget exceeded")
+
 type Executor struct {
 	store           *store.Store
 	codex           *codex.AppServer
@@ -27,23 +31,27 @@ type Executor struct {
 
 	mu       sync.Mutex
 	runtimes map[string]*runtime
+	usageMu  sync.Mutex
 }
 
 type runtime struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu           sync.Mutex
-	paused       bool
-	resumeCh     chan struct{}
-	threadID     string
-	turnID       string
-	maxTurns     int
-	turnCount    int
-	agentTurns   map[string]int
-	allowedRoots []string
-	projectRoots []string
-	projectID    string
+	mu              sync.Mutex
+	paused          bool
+	resumeCh        chan struct{}
+	threadID        string
+	turnID          string
+	maxTurns        int
+	turnCount       int
+	agentTurns      map[string]int
+	promptTokens    int
+	maxPromptTokens int
+	outputBytes     int
+	allowedRoots    []string
+	projectRoots    []string
+	projectID       string
 }
 
 type branchResult struct {
@@ -83,6 +91,7 @@ func (e *Executor) Start(ctx context.Context, workflow model.WorkflowDefinition,
 		StartedAt:  nowValue,
 		UpdatedAt:  nowValue,
 	}
+	run.PromptTokenBudget = promptBudget(workflow)
 	if len(projects) > 0 {
 		run.ProjectID = projects[0].ID
 	}
@@ -254,6 +263,12 @@ func (e *Executor) GetRun(ctx context.Context, runID string) (model.Run, error) 
 	return e.store.GetRun(ctx, runID)
 }
 
+func (e *Executor) ActiveRunCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.runtimes)
+}
+
 func (e *Executor) ListRuns(ctx context.Context, filter model.RunFilter) ([]model.Run, error) {
 	return e.store.ListRuns(ctx, filter)
 }
@@ -314,14 +329,15 @@ func (e *Executor) startRuntime(run model.Run, workflow model.WorkflowDefinition
 		}
 	}
 	rt := &runtime{
-		ctx:          runContext,
-		cancel:       cancel,
-		resumeCh:     make(chan struct{}),
-		maxTurns:     workflow.GlobalLimits.MaxTurns,
-		agentTurns:   make(map[string]int),
-		allowedRoots: allowedRoots,
-		projectRoots: append([]string(nil), configuredProjectRoots...),
-		projectID:    run.ProjectID,
+		ctx:             runContext,
+		cancel:          cancel,
+		resumeCh:        make(chan struct{}),
+		maxTurns:        workflow.GlobalLimits.MaxTurns,
+		agentTurns:      make(map[string]int),
+		maxPromptTokens: promptBudget(workflow),
+		allowedRoots:    allowedRoots,
+		projectRoots:    append([]string(nil), configuredProjectRoots...),
+		projectID:       run.ProjectID,
 	}
 	e.mu.Lock()
 	if previous := e.runtimes[run.ID]; previous != nil {
@@ -330,6 +346,13 @@ func (e *Executor) startRuntime(run model.Run, workflow model.WorkflowDefinition
 	e.runtimes[run.ID] = rt
 	e.mu.Unlock()
 	go e.execute(rt, run, workflow, startNode)
+}
+
+func promptBudget(workflow model.WorkflowDefinition) int {
+	if workflow.GlobalLimits.MaxPromptTokens <= 0 {
+		return defaultPromptTokenBudget
+	}
+	return workflow.GlobalLimits.MaxPromptTokens
 }
 
 func (e *Executor) loadProjectRoots(ctx context.Context, projectID string) []string {
@@ -384,6 +407,7 @@ func (e *Executor) execute(rt *runtime, run model.Run, workflow model.WorkflowDe
 		run.CurrentNodeID = current
 		run.Status = model.RunStatusRunning
 		run.UpdatedAt = now()
+		e.syncRuntimeUsage(&run, rt)
 		_ = e.store.UpdateRun(context.Background(), run)
 		if node.Type == "loop" {
 			counts[node.ID]++
@@ -411,6 +435,7 @@ func (e *Executor) execute(rt *runtime, run model.Run, workflow model.WorkflowDe
 				run.Status = model.RunStatusRunning
 			}
 			run.UpdatedAt = now()
+			e.syncRuntimeUsage(&run, rt)
 			_ = e.store.UpdateRun(context.Background(), run)
 			current = joinID
 			continue
@@ -434,6 +459,7 @@ func (e *Executor) execute(rt *runtime, run model.Run, workflow model.WorkflowDe
 		} else {
 			run.Status = model.RunStatusRunning
 		}
+		e.syncRuntimeUsage(&run, rt)
 		_ = e.store.UpdateRun(context.Background(), run)
 		if node.Type == "join" {
 			// Join nodes are synchronization points; their first matching edge is enough.
@@ -462,6 +488,7 @@ func (e *Executor) execute(rt *runtime, run model.Run, workflow model.WorkflowDe
 		finalRun.UpdatedAt = now()
 		finalRun.CompletedAt = now()
 		finalRun.Paused = false
+		e.syncRuntimeUsage(&finalRun, rt)
 		_ = e.store.UpdateRun(context.Background(), finalRun)
 	}
 	e.appendEvent(context.Background(), model.RunEvent{RunID: run.ID, Type: "run." + finalStatus, Source: "orchestrator", Level: levelForStatus(finalStatus), Message: messageForStatus(finalStatus, errorMessage), Data: map[string]any{"error": errorMessage}})
@@ -625,6 +652,20 @@ func (e *Executor) executeNode(ctx context.Context, rt *runtime, runID string, n
 			return nil, fmt.Errorf("load system prompts: %w", promptErr)
 		}
 		prompt := buildAgentPrompt(agent, workflow, node, input, scope, promptTemplates)
+		estimatedPromptTokens := estimateTextTokens(prompt)
+		usedPromptTokens, budgetErr := rt.reservePromptTokens(estimatedPromptTokens)
+		if budgetErr != nil {
+			agentState = model.AgentStateBlocked
+			agentMessage = budgetErr.Error()
+			e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "usage.budget_exceeded", Source: "orchestrator", Level: "warning", NodeID: node.ID, AgentID: agent.ID, Message: budgetErr.Error(), Data: map[string]any{
+				"estimatedPromptTokens": estimatedPromptTokens,
+				"usedPromptTokens":      usedPromptTokens,
+				"promptTokenBudget":     rt.maxPromptTokens,
+			}})
+			e.updateRunUsage(runID, usedPromptTokens, rt.maxPromptTokens, rt.outputUsage())
+			return nil, budgetErr
+		}
+		e.updateRunUsage(runID, usedPromptTokens, rt.maxPromptTokens, rt.outputUsage())
 		_ = e.store.AppendHistory(context.Background(), model.HistoryEntry{
 			ID:        uuid.NewString(),
 			ProjectID: rt.projectID,
@@ -636,7 +677,9 @@ func (e *Executor) executeNode(ctx context.Context, rt *runtime, runID string, n
 		})
 		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "agent.started", Source: "orchestrator", Level: "info", NodeID: node.ID, AgentID: agent.ID, Message: agent.Name + " started working", Data: map[string]any{
 			"promptBytes":           len(prompt),
-			"estimatedPromptTokens": estimateTextTokens(prompt),
+			"estimatedPromptTokens": estimatedPromptTokens,
+			"usedPromptTokens":      usedPromptTokens,
+			"promptTokenBudget":     rt.maxPromptTokens,
 			"contextPolicy":         "input-and-direct-upstream",
 			"contextBudgetBytes":    maxAgentPromptContextBytes,
 		}})
@@ -655,6 +698,8 @@ func (e *Executor) executeNode(ctx context.Context, rt *runtime, runID string, n
 			e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "codex." + notification.Method, Source: "codex", Level: eventLevel(notification.Method), NodeID: node.ID, AgentID: agent.ID, Message: notification.Method, Data: data})
 		})
 		cancel()
+		outputBytes := rt.recordOutput(len(result.Output))
+		e.updateRunUsage(runID, usedPromptTokens, rt.maxPromptTokens, outputBytes)
 		if step, stepErr := e.store.GetRunStep(context.Background(), runID, node.ID); stepErr == nil {
 			step.ThreadID = result.ThreadID
 			step.TurnID = result.TurnID
@@ -781,6 +826,77 @@ func (e *Executor) waitIfPaused(ctx context.Context, rt *runtime) error {
 		case <-resumeCh:
 		}
 	}
+}
+
+func (rt *runtime) reservePromptTokens(estimated int) (int, error) {
+	if estimated <= 0 {
+		return 0, nil
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.maxPromptTokens > 0 && rt.promptTokens+estimated > rt.maxPromptTokens {
+		return rt.promptTokens, fmt.Errorf("%w: used %d of %d estimated tokens", ErrPromptBudgetExceeded, rt.promptTokens, rt.maxPromptTokens)
+	}
+	rt.promptTokens += estimated
+	return rt.promptTokens, nil
+}
+
+func (rt *runtime) recordOutput(bytes int) int {
+	if bytes <= 0 {
+		return 0
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.outputBytes += bytes
+	return rt.outputBytes
+}
+
+func (rt *runtime) outputUsage() int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.outputBytes
+}
+
+func (rt *runtime) usage() (int, int, int) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.promptTokens, rt.maxPromptTokens, rt.outputBytes
+}
+
+func (e *Executor) syncRuntimeUsage(run *model.Run, rt *runtime) {
+	if run == nil || rt == nil {
+		return
+	}
+	promptTokens, promptBudget, outputBytes := rt.usage()
+	if promptTokens > run.PromptTokensUsed {
+		run.PromptTokensUsed = promptTokens
+	}
+	if promptBudget > 0 {
+		run.PromptTokenBudget = promptBudget
+	}
+	if outputBytes > run.OutputBytes {
+		run.OutputBytes = outputBytes
+	}
+}
+
+func (e *Executor) updateRunUsage(runID string, promptTokens, promptBudget, outputBytes int) {
+	e.usageMu.Lock()
+	defer e.usageMu.Unlock()
+	run, err := e.store.GetRun(context.Background(), runID)
+	if err != nil {
+		return
+	}
+	if promptTokens > run.PromptTokensUsed {
+		run.PromptTokensUsed = promptTokens
+	}
+	if promptBudget > 0 {
+		run.PromptTokenBudget = promptBudget
+	}
+	if outputBytes > run.OutputBytes {
+		run.OutputBytes = outputBytes
+	}
+	run.UpdatedAt = now()
+	_ = e.store.UpdateRun(context.Background(), run)
 }
 
 func (e *Executor) updateRunStatus(runID, status, errorMessage string) error {

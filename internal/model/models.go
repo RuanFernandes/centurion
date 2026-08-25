@@ -105,6 +105,7 @@ type ModelInfo struct {
 
 type AgentProfile struct {
 	ID                 string   `json:"id"`
+	ProjectID          string   `json:"projectID,omitempty"`
 	Name               string   `json:"name"`
 	Role               string   `json:"role"`
 	Instructions       string   `json:"instructions"`
@@ -204,15 +205,27 @@ type Project struct {
 	Name         string   `json:"name"`
 	Description  string   `json:"description,omitempty"`
 	Folders      []string `json:"folders"`
+	ManifestPath string   `json:"manifestPath,omitempty"`
 	CreatedAt    string   `json:"createdAt"`
 	UpdatedAt    string   `json:"updatedAt"`
 	LastOpenedAt string   `json:"lastOpenedAt,omitempty"`
+}
+
+type ProjectSnapshot struct {
+	SchemaVersion int                  `json:"schemaVersion"`
+	ExportedAt    string               `json:"exportedAt"`
+	Project       Project              `json:"project"`
+	Agents        []AgentProfile       `json:"agents"`
+	Workflows     []WorkflowDefinition `json:"workflows"`
+	Schedules     []Schedule           `json:"schedules"`
+	History       []HistoryEntry       `json:"history"`
 }
 
 type WorkflowLimits struct {
 	MaxDurationSeconds int `json:"maxDurationSeconds"`
 	MaxParallel        int `json:"maxParallel"`
 	MaxTurns           int `json:"maxTurns"`
+	MaxPromptTokens    int `json:"maxPromptTokens"`
 }
 
 type RetryPolicy struct {
@@ -244,6 +257,7 @@ type WorkflowEdge struct {
 
 type WorkflowDefinition struct {
 	ID           string         `json:"id"`
+	ProjectID    string         `json:"projectID,omitempty"`
 	Name         string         `json:"name"`
 	Version      int            `json:"version"`
 	Description  string         `json:"description,omitempty"`
@@ -269,19 +283,22 @@ type WorkflowValidation struct {
 }
 
 type Run struct {
-	ID              string         `json:"id"`
-	ProjectID       string         `json:"projectID,omitempty"`
-	WorkflowID      string         `json:"workflowID"`
-	Status          string         `json:"status"`
-	Input           map[string]any `json:"input,omitempty"`
-	Output          map[string]any `json:"output,omitempty"`
-	CurrentNodeID   string         `json:"currentNodeID,omitempty"`
-	StartedAt       string         `json:"startedAt"`
-	UpdatedAt       string         `json:"updatedAt"`
-	CompletedAt     string         `json:"completedAt,omitempty"`
-	Error           string         `json:"error,omitempty"`
-	CancelRequested bool           `json:"cancelRequested"`
-	Paused          bool           `json:"paused"`
+	ID                string         `json:"id"`
+	ProjectID         string         `json:"projectID,omitempty"`
+	WorkflowID        string         `json:"workflowID"`
+	Status            string         `json:"status"`
+	Input             map[string]any `json:"input,omitempty"`
+	Output            map[string]any `json:"output,omitempty"`
+	CurrentNodeID     string         `json:"currentNodeID,omitempty"`
+	StartedAt         string         `json:"startedAt"`
+	UpdatedAt         string         `json:"updatedAt"`
+	CompletedAt       string         `json:"completedAt,omitempty"`
+	Error             string         `json:"error,omitempty"`
+	CancelRequested   bool           `json:"cancelRequested"`
+	Paused            bool           `json:"paused"`
+	PromptTokensUsed  int            `json:"promptTokensUsed"`
+	PromptTokenBudget int            `json:"promptTokenBudget"`
+	OutputBytes       int            `json:"outputBytes"`
 }
 
 type RunFilter struct {
@@ -305,6 +322,37 @@ type HistoryFilter struct {
 	ProjectID string `json:"projectID,omitempty"`
 	Kind      string `json:"kind,omitempty"`
 	Limit     int    `json:"limit,omitempty"`
+}
+
+type AuditEntry struct {
+	ID        string         `json:"id"`
+	ProjectID string         `json:"projectID,omitempty"`
+	RunID     string         `json:"runID,omitempty"`
+	Kind      string         `json:"kind"`
+	Actor     string         `json:"actor"`
+	Target    string         `json:"target,omitempty"`
+	Decision  string         `json:"decision,omitempty"`
+	Detail    string         `json:"detail,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+	CreatedAt string         `json:"createdAt"`
+}
+
+type AuditFilter struct {
+	ProjectID string `json:"projectID,omitempty"`
+	RunID     string `json:"runID,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+}
+
+type RuntimeStatus struct {
+	Connected      bool   `json:"connected"`
+	CodexCommand   string `json:"codexCommand"`
+	AppServerPID   int    `json:"appServerPID,omitempty"`
+	ActiveSessions int    `json:"activeSessions"`
+	MaxSessions    int    `json:"maxSessions"`
+	ActiveRuns     int    `json:"activeRuns"`
+	AuthStatus     string `json:"authStatus"`
+	UpdatedAt      string `json:"updatedAt"`
 }
 
 type TerminalResult struct {

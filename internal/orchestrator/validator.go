@@ -33,6 +33,11 @@ func ValidateWorkflow(workflow model.WorkflowDefinition) model.WorkflowValidatio
 	if workflow.GlobalLimits.MaxTurns <= 0 {
 		addError(&validation, "workflow.limit.turns", "globalLimits.maxTurns", "maxTurns must be greater than zero")
 	}
+	if workflow.GlobalLimits.MaxPromptTokens < 0 || workflow.GlobalLimits.MaxPromptTokens > 1_000_000 {
+		addError(&validation, "workflow.limit.prompt_tokens", "globalLimits.maxPromptTokens", "maxPromptTokens must be between zero and one million")
+	} else if workflow.GlobalLimits.MaxPromptTokens == 0 {
+		addWarning(&validation, "workflow.limit.prompt_tokens.defaulted", "globalLimits.maxPromptTokens", "maxPromptTokens is zero and will default to 12000 estimated tokens")
+	}
 
 	nodes := make(map[string]model.WorkflowNode, len(workflow.Nodes))
 	for index, node := range workflow.Nodes {

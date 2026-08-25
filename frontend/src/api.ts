@@ -1,6 +1,7 @@
 import { AppService as GeneratedAppService } from '../bindings/github.com/RuanFernandes/centurion'
 import type {
   AgentProfile,
+  AuditEntry,
   BuilderApplyRequest,
   BuilderApplyResult,
   BuilderRequest,
@@ -10,12 +11,12 @@ import type {
   ApprovalDecision,
   AuthState,
   HistoryEntry,
-  LoginStart,
   MCPServer,
   ModelInfo,
   Project,
   Run,
   RunEvent,
+  RuntimeStatus,
   Schedule,
   SystemPrompt,
   TerminalResult,
@@ -28,8 +29,6 @@ const resolve = <T,>(value: unknown) => Promise.resolve(value as T)
 
 export const api = {
   getAuthState: () => resolve<AuthState>(GeneratedAppService.GetAuthState()),
-  beginChatGPTLogin: () => resolve<LoginStart>(GeneratedAppService.BeginChatGPTLogin()),
-  logout: () => resolve<void>(GeneratedAppService.Logout()),
   listModels: () => resolve<ModelInfo[]>(GeneratedAppService.ListModels()),
   listSystemPrompts: () => resolve<SystemPrompt[]>(GeneratedAppService.ListSystemPrompts()),
   updateSystemPrompt: (promptID: string, template: string) => resolve<SystemPrompt>(GeneratedAppService.UpdateSystemPrompt(promptID, template)),
@@ -56,6 +55,9 @@ export const api = {
   setActiveProject: (projectID: string) => resolve<Project>(GeneratedAppService.SetActiveProject(projectID)),
   deleteProject: (projectID: string) => resolve<void>(GeneratedAppService.DeleteProject(projectID)),
   listHistory: (filter: { projectID?: string; kind?: string; limit?: number } = {}) => resolve<HistoryEntry[]>(GeneratedAppService.ListHistory(filter)),
+  listAudit: (filter: { projectID?: string; runID?: string; kind?: string; limit?: number } = {}) => resolve<AuditEntry[]>(GeneratedAppService.ListAudit(filter)),
+  exportProjectSnapshot: (projectID = '') => resolve<string>(GeneratedAppService.ExportProjectSnapshot(projectID)),
+  getRuntimeStatus: () => resolve<RuntimeStatus>(GeneratedAppService.GetRuntimeStatus()),
   runTerminalCommand: (projectID: string, command: string, workingDir: string) => resolve<TerminalResult>(GeneratedAppService.RunTerminalCommand(projectID, command, workingDir)),
   startRun: (workflowID: string, input: JsonMap) => resolve<Run>(GeneratedAppService.StartRun(workflowID, input)),
   pauseRun: (runID: string) => resolve<void>(GeneratedAppService.PauseRun(runID)),

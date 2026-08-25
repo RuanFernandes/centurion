@@ -1,0 +1,66 @@
+name: Release Windows build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build and publish Windows artifact
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.117
+
+      - name: Add Go tools to PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "$env:USERPROFILE\go\bin"
+
+      - name: Generate bindings
+        run: wails3 generate bindings -clean=true -ts -i
+
+      - name: Build Centurion
+        run: wails3 build
+
+      - name: Package portable artifact
+        shell: pwsh
+        run: Compress-Archive -Path bin/centurion.exe -DestinationPath bin/centurion-windows-amd64.zip
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: gh release create "$env:RELEASE_TAG" bin/centurion-windows-amd64.zip --repo "${{ github.repository }}" --verify-tag --generate-notes

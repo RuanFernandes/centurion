@@ -84,6 +84,14 @@ type Client struct {
 }
 
 func NewClient(command string, args ...string) *Client {
+	return newClient(command, append([]string{"app-server"}, args...))
+}
+
+func newRawClient(command string, args ...string) *Client {
+	return newClient(command, args)
+}
+
+func newClient(command string, args []string) *Client {
 	if strings.TrimSpace(command) == "" {
 		command = "codex"
 	}
@@ -108,7 +116,7 @@ func (c *Client) Start(parent context.Context) error {
 		return fmt.Errorf("find codex executable: %w", err)
 	}
 	processCtx, cancel := context.WithCancel(parent)
-	cmd := exec.CommandContext(processCtx, command, append([]string{"app-server"}, c.args...)...)
+	cmd := exec.CommandContext(processCtx, command, c.args...)
 	configureHiddenProcess(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -174,6 +182,21 @@ func (c *Client) IsConnected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.cmd != nil && c.done != nil
+}
+
+func (c *Client) Command() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.command
+}
+
+func (c *Client) PID() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd == nil || c.cmd.Process == nil {
+		return 0
+	}
+	return c.cmd.Process.Pid
 }
 
 func (c *Client) Diagnostics() []string {

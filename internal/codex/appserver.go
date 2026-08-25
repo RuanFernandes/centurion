@@ -43,11 +43,15 @@ func (a *AppServer) Diagnostics() []string {
 }
 
 func NewAppServer(command string, onNotification func(model.CodexNotification), onServerRequest func(ServerRequest)) *AppServer {
+	return newAppServerWithClient(NewClient(command), onNotification, onServerRequest)
+}
+
+func newAppServerWithClient(client *Client, onNotification func(model.CodexNotification), onServerRequest func(ServerRequest)) *AppServer {
 	appServer := &AppServer{
-		client:          NewClient(command),
+		client:          client,
 		onNotification:  onNotification,
 		onServerRequest: onServerRequest,
-		sessions:        NewSessionManager(128),
+		sessions:        NewSessionManager(16),
 		auth:            model.AuthState{Status: model.AuthStatusOffline, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)},
 		capabilities:    model.AppCapabilities{ExperimentalAPI: true},
 	}
@@ -133,6 +137,20 @@ func (a *AppServer) Stop() error {
 
 func (a *AppServer) IsConnected() bool { return a.client.IsConnected() }
 
+func (a *AppServer) RuntimeStatus() model.RuntimeStatus {
+	state := a.AuthState()
+	stats := a.sessions.Stats()
+	return model.RuntimeStatus{
+		Connected:      a.client.IsConnected(),
+		CodexCommand:   a.client.Command(),
+		AppServerPID:   a.client.PID(),
+		ActiveSessions: stats.Active,
+		MaxSessions:    stats.Max,
+		AuthStatus:     state.Status,
+		UpdatedAt:      now(),
+	}
+}
+
 func (a *AppServer) AuthState() model.AuthState {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -161,8 +179,8 @@ func (a *AppServer) CanRun() error {
 	if auth.RateLimit != nil && auth.RateLimit.IsReached() {
 		return errors.New("codex rate limit reached; automatic runs are paused")
 	}
-	if auth.Status != model.AuthStatusLoggedIn {
-		return errors.New("login with ChatGPT in Codex before starting a run")
+	if auth.Status == model.AuthStatusLoggedOut || (auth.Status == model.AuthStatusError && auth.RequiresOpenAIAuth) {
+		return errors.New("Codex is not authenticated; sign in through the Codex CLI. Centurion does not manage account login")
 	}
 	return nil
 }

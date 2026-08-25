@@ -27,6 +27,21 @@ func TestRuntimeEnforcesTurnLimits(t *testing.T) {
 	}
 }
 
+func TestRuntimeEnforcesPromptTokenBudget(t *testing.T) {
+	rt := &runtime{maxPromptTokens: 100, agentTurns: make(map[string]int)}
+	used, err := rt.reservePromptTokens(60)
+	if err != nil || used != 60 {
+		t.Fatalf("expected the first prompt reservation to succeed: used=%d err=%v", used, err)
+	}
+	if _, err := rt.reservePromptTokens(41); err == nil {
+		t.Fatal("expected the prompt budget to reject the reservation")
+	}
+	used, err = rt.reservePromptTokens(40)
+	if err != nil || used != 100 {
+		t.Fatalf("expected an exact budget reservation to succeed: used=%d err=%v", used, err)
+	}
+}
+
 func TestAgentPromptUsesOnlyDirectUpstreamOutputs(t *testing.T) {
 	workflow := model.WorkflowDefinition{
 		Edges: []model.WorkflowEdge{

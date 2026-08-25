@@ -16,6 +16,7 @@ import (
 	"github.com/RuanFernandes/centurion/internal/codex"
 	"github.com/RuanFernandes/centurion/internal/model"
 	"github.com/RuanFernandes/centurion/internal/orchestrator"
+	projectmanifest "github.com/RuanFernandes/centurion/internal/project"
 	"github.com/RuanFernandes/centurion/internal/scheduler"
 	"github.com/RuanFernandes/centurion/internal/security"
 	"github.com/RuanFernandes/centurion/internal/store"
@@ -152,26 +153,10 @@ func (s *AppService) GetAuthState() model.AuthState {
 	return s.auth
 }
 
-func (s *AppService) BeginChatGPTLogin() (model.LoginStart, error) {
-	if err := s.ensureConnected(); err != nil {
-		return model.LoginStart{}, err
-	}
-	ctx, cancel := operationContext()
-	defer cancel()
-	return s.codex.BeginChatGPTLogin(ctx)
-}
-
-func (s *AppService) Logout() error {
-	ctx, cancel := operationContext()
-	defer cancel()
-	if err := s.codex.Logout(ctx); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.auth = s.codex.AuthState()
-	s.mu.Unlock()
-	s.emitAuth()
-	return nil
+func (s *AppService) GetRuntimeStatus() model.RuntimeStatus {
+	status := s.codex.RuntimeStatus()
+	status.ActiveRuns = s.executor.ActiveRunCount()
+	return status
 }
 
 func (s *AppService) ListModels() ([]model.ModelInfo, error) {
@@ -252,6 +237,9 @@ func (s *AppService) ReloadMCPServers() error {
 func (s *AppService) ListAgents() ([]model.AgentProfile, error) {
 	ctx, cancel := operationContext()
 	defer cancel()
+	if project, err := s.store.GetActiveProject(ctx); err == nil {
+		return s.store.ListAgentsForProject(ctx, project.ID)
+	}
 	return s.store.ListAgents(ctx)
 }
 
@@ -277,6 +265,13 @@ func (s *AppService) CreateAgent(profile model.AgentProfile) (model.AgentProfile
 	if profile.MaxAttempts <= 0 {
 		profile.MaxAttempts = 2
 	}
+	ctx, cancel := operationContext()
+	defer cancel()
+	if profile.ProjectID == "" {
+		if active, err := s.store.GetActiveProject(ctx); err == nil {
+			profile.ProjectID = active.ID
+		}
+	}
 	if len(profile.WorkspaceRoots) > 0 {
 		roots, err := security.NormalizeRoots(profile.WorkspaceRoots)
 		if err != nil {
@@ -284,8 +279,6 @@ func (s *AppService) CreateAgent(profile model.AgentProfile) (model.AgentProfile
 		}
 		profile.WorkspaceRoots = roots
 	}
-	ctx, cancel := operationContext()
-	defer cancel()
 	if err := s.store.SaveAgent(ctx, profile); err != nil {
 		return model.AgentProfile{}, err
 	}
@@ -318,9 +311,19 @@ func (s *AppService) UpdateAgent(profile model.AgentProfile) (model.AgentProfile
 	if profile.MaxAttempts <= 0 {
 		profile.MaxAttempts = 2
 	}
-	profile.UpdatedAt = now()
 	ctx, cancel := operationContext()
 	defer cancel()
+	if profile.ProjectID == "" {
+		if existing, err := s.store.GetAgent(ctx, profile.ID); err == nil {
+			profile.ProjectID = existing.ProjectID
+		}
+		if profile.ProjectID == "" {
+			if active, err := s.store.GetActiveProject(ctx); err == nil {
+				profile.ProjectID = active.ID
+			}
+		}
+	}
+	profile.UpdatedAt = now()
 	if err := s.store.SaveAgent(ctx, profile); err != nil {
 		return model.AgentProfile{}, err
 	}
@@ -354,6 +357,11 @@ func (s *AppService) SaveWorkflow(definition model.WorkflowDefinition) (model.Wo
 	definition.UpdatedAt = now()
 	ctx, cancel := operationContext()
 	defer cancel()
+	if definition.ProjectID == "" {
+		if active, err := s.store.GetActiveProject(ctx); err == nil {
+			definition.ProjectID = active.ID
+		}
+	}
 	if err := s.store.SaveWorkflow(ctx, definition); err != nil {
 		return model.WorkflowDefinition{}, err
 	}
@@ -375,19 +383,33 @@ func (s *AppService) LoadWorkflow(workflowID string) (model.WorkflowDefinition, 
 func (s *AppService) ListWorkflows() ([]model.WorkflowDefinition, error) {
 	ctx, cancel := operationContext()
 	defer cancel()
+	if project, err := s.store.GetActiveProject(ctx); err == nil {
+		return s.store.ListWorkflowsForProject(ctx, project.ID)
+	}
 	return s.store.ListWorkflows(ctx)
 }
 
 func (s *AppService) ListProjects() ([]model.Project, error) {
 	ctx, cancel := operationContext()
 	defer cancel()
-	return s.store.ListProjects(ctx)
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for index := range projects {
+		projects[index] = withManifestPath(projects[index])
+	}
+	return projects, nil
 }
 
 func (s *AppService) GetActiveProject() (model.Project, error) {
 	ctx, cancel := operationContext()
 	defer cancel()
-	return s.store.GetActiveProject(ctx)
+	project, err := s.store.GetActiveProject(ctx)
+	if err != nil {
+		return model.Project{}, err
+	}
+	return withManifestPath(project), nil
 }
 
 func (s *AppService) CreateProject(project model.Project) (model.Project, error) {
@@ -403,6 +425,11 @@ func (s *AppService) CreateProject(project model.Project) (model.Project, error)
 	}
 	project.CreatedAt = now()
 	project.UpdatedAt = project.CreatedAt
+	manifestPath, err := projectmanifest.WriteManifest(project)
+	if err != nil {
+		return model.Project{}, err
+	}
+	project.ManifestPath = manifestPath
 	ctx, cancel := operationContext()
 	defer cancel()
 	if err := s.store.SaveProject(ctx, project); err != nil {
@@ -417,6 +444,7 @@ func (s *AppService) CreateProject(project model.Project) (model.Project, error)
 		Metadata:  map[string]any{"folders": project.Folders},
 		CreatedAt: now(),
 	})
+	_ = s.store.AppendAudit(ctx, model.AuditEntry{ProjectID: project.ID, Kind: "project.created", Actor: "user", Target: project.ID, Detail: "Project created", Metadata: map[string]any{"folders": project.Folders}, CreatedAt: now()})
 	return project, nil
 }
 
@@ -441,9 +469,15 @@ func (s *AppService) UpdateProject(project model.Project) (model.Project, error)
 	project.CreatedAt = existing.CreatedAt
 	project.UpdatedAt = now()
 	project.LastOpenedAt = existing.LastOpenedAt
+	manifestPath, err := projectmanifest.WriteManifest(project)
+	if err != nil {
+		return model.Project{}, err
+	}
+	project.ManifestPath = manifestPath
 	if err := s.store.SaveProject(ctx, project); err != nil {
 		return model.Project{}, err
 	}
+	_ = s.store.AppendAudit(ctx, model.AuditEntry{ProjectID: project.ID, Kind: "project.updated", Actor: "user", Target: project.ID, Detail: "Project settings updated", Metadata: map[string]any{"folders": project.Folders}, CreatedAt: now()})
 	return project, nil
 }
 
@@ -461,6 +495,7 @@ func (s *AppService) SetActiveProject(projectID string) (model.Project, error) {
 	if err != nil {
 		return model.Project{}, err
 	}
+	project = withManifestPath(project)
 	_ = s.store.AppendHistory(ctx, model.HistoryEntry{
 		ID:        uuid.NewString(),
 		ProjectID: project.ID,
@@ -469,6 +504,7 @@ func (s *AppService) SetActiveProject(projectID string) (model.Project, error) {
 		Content:   project.Name,
 		CreatedAt: now(),
 	})
+	_ = s.store.AppendAudit(ctx, model.AuditEntry{ProjectID: project.ID, Kind: "project.opened", Actor: "user", Target: project.ID, Detail: "Project opened", CreatedAt: now()})
 	s.emit("project.updated", project)
 	return project, nil
 }
@@ -491,6 +527,7 @@ func (s *AppService) DeleteProject(projectID string) error {
 	if err := s.store.DeleteProject(ctx, projectID); err != nil {
 		return err
 	}
+	_ = s.store.AppendAudit(ctx, model.AuditEntry{ProjectID: projectID, Kind: "project.deleted", Actor: "user", Target: projectID, Detail: "Project deleted", CreatedAt: now()})
 	if activeErr == nil && active.ID == projectID {
 		for _, project := range projects {
 			if project.ID != projectID {
@@ -515,6 +552,56 @@ func (s *AppService) ListHistory(filter model.HistoryFilter) ([]model.HistoryEnt
 	return s.store.ListHistory(ctx, filter)
 }
 
+func (s *AppService) ListAudit(filter model.AuditFilter) ([]model.AuditEntry, error) {
+	ctx, cancel := operationContext()
+	defer cancel()
+	if strings.TrimSpace(filter.ProjectID) == "" {
+		if project, err := s.store.GetActiveProject(ctx); err == nil {
+			filter.ProjectID = project.ID
+		}
+	}
+	return s.store.ListAudit(ctx, filter)
+}
+
+func (s *AppService) ExportProjectSnapshot(projectID string) (string, error) {
+	ctx, cancel := operationContext()
+	defer cancel()
+	project, err := projectForID(ctx, s.store, projectID)
+	if err != nil {
+		return "", err
+	}
+	agents, err := s.store.ListAgentsForProject(ctx, project.ID)
+	if err != nil {
+		return "", err
+	}
+	workflows, err := s.store.ListWorkflowsForProject(ctx, project.ID)
+	if err != nil {
+		return "", err
+	}
+	schedules, err := s.store.ListSchedulesForProject(ctx, project.ID)
+	if err != nil {
+		return "", err
+	}
+	history, err := s.store.ListHistory(ctx, model.HistoryFilter{ProjectID: project.ID, Limit: 500})
+	if err != nil {
+		return "", err
+	}
+	path, err := projectmanifest.WriteSnapshot(model.ProjectSnapshot{
+		SchemaVersion: 1,
+		ExportedAt:    now(),
+		Project:       project,
+		Agents:        agents,
+		Workflows:     workflows,
+		Schedules:     schedules,
+		History:       history,
+	})
+	if err != nil {
+		return "", err
+	}
+	_ = s.store.AppendAudit(ctx, model.AuditEntry{ProjectID: project.ID, Kind: "project.export", Actor: "user", Target: path, Detail: "Project snapshot exported", CreatedAt: now()})
+	return path, nil
+}
+
 func (s *AppService) StartRun(workflowID string, input map[string]any) (model.Run, error) {
 	ctx, cancel := operationContext()
 	defer cancel()
@@ -525,6 +612,16 @@ func (s *AppService) StartRun(workflowID string, input map[string]any) (model.Ru
 	project, err := s.store.GetActiveProject(ctx)
 	if err != nil {
 		return model.Run{}, fmt.Errorf("load active project: %w", err)
+	}
+	if workflow.ProjectID != "" && workflow.ProjectID != project.ID {
+		if trigger, _ := input["trigger"].(string); trigger == "schedule" {
+			project, err = s.store.GetProject(ctx, workflow.ProjectID)
+			if err != nil {
+				return model.Run{}, fmt.Errorf("load scheduled workflow project: %w", err)
+			}
+		} else {
+			return model.Run{}, errors.New("workflow belongs to a different project")
+		}
 	}
 	run, err := s.executor.Start(ctx, workflow, input, project)
 	if err == nil {
@@ -538,6 +635,7 @@ func (s *AppService) StartRun(workflowID string, input map[string]any) (model.Ru
 			Metadata:  map[string]any{"runID": run.ID, "workflowID": workflow.ID},
 			CreatedAt: now(),
 		})
+		_ = s.store.AppendAudit(ctx, model.AuditEntry{ProjectID: run.ProjectID, RunID: run.ID, Kind: "run.started", Actor: "user", Target: workflow.ID, Detail: "Workflow run started", CreatedAt: now()})
 		s.emit("run.created", run)
 	}
 	return run, err
@@ -613,6 +711,7 @@ func (s *AppService) RunTerminalCommand(projectID, command, workingDir string) (
 		Metadata:  map[string]any{"workingDir": workingDir, "exitCode": exitCode, "durationMs": duration},
 		CreatedAt: now(),
 	})
+	_ = s.store.AppendAudit(context.Background(), model.AuditEntry{ProjectID: project.ID, Kind: "terminal.command", Actor: "user", Target: workingDir, Decision: commandDecision(exitCode), Detail: command, Metadata: map[string]any{"exitCode": exitCode, "durationMs": duration, "truncated": result.Truncated}, CreatedAt: now()})
 	return result, nil
 }
 
@@ -655,6 +754,11 @@ func (s *AppService) GetRun(runID string) (model.Run, error) {
 func (s *AppService) ListRuns(filter model.RunFilter) ([]model.Run, error) {
 	ctx, cancel := operationContext()
 	defer cancel()
+	if strings.TrimSpace(filter.ProjectID) == "" {
+		if project, err := s.store.GetActiveProject(ctx); err == nil {
+			filter.ProjectID = project.ID
+		}
+	}
 	return s.executor.ListRuns(ctx, filter)
 }
 
@@ -678,6 +782,7 @@ func (s *AppService) ResolveApproval(decision model.ApprovalDecision) error {
 		delete(s.approvals, decision.ID)
 		s.mu.Unlock()
 		pending.response <- decision.Decision == "approve" || decision.Decision == "accept"
+		s.appendApprovalAudit(pending.request, decision.Decision, "user")
 		s.emit("approval.resolved", decision)
 		return nil
 	}
@@ -700,6 +805,7 @@ func (s *AppService) ResolveApproval(decision model.ApprovalDecision) error {
 	if err := s.codexRespond(ctx, pending.serverID, response); err != nil {
 		return err
 	}
+	s.appendApprovalAudit(pending.request, decision.Decision, "user")
 	s.emit("approval.resolved", decision)
 	return nil
 }
@@ -763,6 +869,9 @@ func (s *AppService) DeleteSchedule(scheduleID string) error {
 func (s *AppService) ListSchedules() ([]model.Schedule, error) {
 	ctx, cancel := operationContext()
 	defer cancel()
+	if project, err := s.store.GetActiveProject(ctx); err == nil {
+		return s.store.ListSchedulesForProject(ctx, project.ID)
+	}
 	return s.store.ListSchedules(ctx)
 }
 
@@ -785,17 +894,52 @@ func (s *AppService) requestApproval(ctx context.Context, request model.Approval
 	s.mu.Lock()
 	s.approvals[request.ID] = &pendingApproval{request: request, response: response}
 	s.mu.Unlock()
+	s.appendApprovalAudit(request, "requested", "system")
 	s.emit("approval.requested", request)
 	select {
 	case approved := <-response:
+		decision := "decline"
+		if approved {
+			decision = "approve"
+		}
+		s.appendApprovalAudit(request, decision, "user")
 		return approved, nil
 	case <-ctx.Done():
 		s.mu.Lock()
 		delete(s.approvals, request.ID)
 		s.mu.Unlock()
 		s.emit("approval.resolved", model.ApprovalDecision{ID: request.ID, Decision: "timeout"})
+		s.appendApprovalAudit(request, "timeout", "system")
 		return false, ctx.Err()
 	}
+}
+
+func (s *AppService) appendApprovalAudit(request model.ApprovalRequest, decision, actor string) {
+	projectID := ""
+	if request.RunID != "" {
+		if run, err := s.store.GetRun(context.Background(), request.RunID); err == nil {
+			projectID = run.ProjectID
+		}
+	}
+	_ = s.store.AppendAudit(context.Background(), model.AuditEntry{
+		ID:        request.ID + "-" + decision,
+		ProjectID: projectID,
+		RunID:     request.RunID,
+		Kind:      "approval." + decision,
+		Actor:     actor,
+		Target:    request.Kind,
+		Decision:  decision,
+		Detail:    request.Detail,
+		Metadata:  map[string]any{"title": request.Title, "threadID": request.ThreadID, "turnID": request.TurnID},
+		CreatedAt: now(),
+	})
+}
+
+func commandDecision(exitCode int) string {
+	if exitCode == 0 {
+		return "completed"
+	}
+	return "failed"
 }
 
 func (s *AppService) handleServerRequest(request codex.ServerRequest) {
@@ -829,6 +973,7 @@ func (s *AppService) handleServerRequest(request codex.ServerRequest) {
 	s.mu.Lock()
 	s.approvals[id] = &pendingApproval{request: requestModel, serverID: append([]byte(nil), request.ID...), serverParams: params, serverMethod: request.Method}
 	s.mu.Unlock()
+	s.appendApprovalAudit(requestModel, "requested", "codex")
 	s.emit("approval.requested", requestModel)
 	time.AfterFunc(5*time.Minute, func() {
 		s.mu.Lock()
@@ -846,6 +991,7 @@ func (s *AppService) handleServerRequest(request codex.ServerRequest) {
 			}
 			cancel()
 			s.emit("approval.resolved", model.ApprovalDecision{ID: id, Decision: "timeout"})
+			s.appendApprovalAudit(requestModel, "timeout", "system")
 		}
 	})
 }
@@ -942,6 +1088,13 @@ func normalizeProjectFolders(project *model.Project) error {
 	}
 	project.Folders = normalized
 	return nil
+}
+
+func withManifestPath(value model.Project) model.Project {
+	if path, err := projectmanifest.ManifestPath(value.Folders); err == nil {
+		value.ManifestPath = path
+	}
+	return value
 }
 
 func projectForID(ctx context.Context, dataStore *store.Store, projectID string) (model.Project, error) {

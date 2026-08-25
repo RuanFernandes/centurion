@@ -204,3 +204,76 @@ func TestStorePersistsMultiFolderProjectsAndHistory(t *testing.T) {
 		t.Fatalf("history round-trip failed: %#v, %v", entries, err)
 	}
 }
+
+func TestStoreScopesProjectCatalogs(t *testing.T) {
+	dataStore, err := Open(filepath.Join(t.TempDir(), "centurion.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	ctx := context.Background()
+	for _, project := range []model.Project{
+		{ID: "project-a", Name: "Project A", Folders: []string{t.TempDir()}},
+		{ID: "project-b", Name: "Project B", Folders: []string{t.TempDir()}},
+	} {
+		if err := dataStore.SaveProject(ctx, project); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, agent := range []model.AgentProfile{
+		{ID: "agent-a", ProjectID: "project-a", Name: "Agent A", Role: "Builder"},
+		{ID: "agent-b", ProjectID: "project-b", Name: "Agent B", Role: "Reviewer"},
+	} {
+		if err := dataStore.SaveAgent(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	baseWorkflow, err := dataStore.GetWorkflow(ctx, "workflow-studio-brief")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, projectID := range []string{"project-a", "project-b"} {
+		workflow := baseWorkflow
+		workflow.ID = "workflow-" + projectID
+		workflow.ProjectID = projectID
+		if err := dataStore.SaveWorkflow(ctx, workflow); err != nil {
+			t.Fatal(err)
+		}
+	}
+	agents, err := dataStore.ListAgentsForProject(ctx, "project-a")
+	if err != nil || len(agents) != 1 || agents[0].ID != "agent-a" {
+		t.Fatalf("project A agent catalog leaked: %#v, %v", agents, err)
+	}
+	workflows, err := dataStore.ListWorkflowsForProject(ctx, "project-b")
+	if err != nil || len(workflows) != 1 || workflows[0].ID != "workflow-project-b" {
+		t.Fatalf("project B workflow catalog leaked: %#v, %v", workflows, err)
+	}
+}
+
+func TestStorePersistsRedactedAuditEntries(t *testing.T) {
+	dataStore, err := Open(filepath.Join(t.TempDir(), "centurion.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	ctx := context.Background()
+	if err := dataStore.AppendAudit(ctx, model.AuditEntry{
+		ProjectID: "project-local",
+		RunID:     "run-audit",
+		Kind:      "approval",
+		Actor:     "user",
+		Target:    "command",
+		Decision:  "approve",
+		Detail:    "Authorization: Bearer secret-value",
+		Metadata:  map[string]any{"token": "access_token=do-not-store"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := dataStore.ListAudit(ctx, model.AuditFilter{RunID: "run-audit"})
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("audit entry was not persisted: %#v, %v", entries, err)
+	}
+	if entries[0].Detail == "" || entries[0].Detail == "Authorization: Bearer secret-value" || entries[0].Metadata["token"] == "access_token=do-not-store" {
+		t.Fatalf("audit entry was not redacted: %#v", entries[0])
+	}
+}

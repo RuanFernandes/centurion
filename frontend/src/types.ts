@@ -145,6 +145,7 @@ export type Project = {
   name: string
   description?: string
   folders: string[]
+  manifestPath?: string
   createdAt: string
   updatedAt: string
   lastOpenedAt?: string
@@ -189,6 +190,7 @@ export type WorkflowDefinition = {
     maxDurationSeconds: number
     maxParallel: number
     maxTurns: number
+    maxPromptTokens: number
   }
   errorPolicy: string
   createdAt: string
@@ -212,6 +214,33 @@ export type Run = {
   error?: string
   cancelRequested?: boolean
   paused?: boolean
+  promptTokensUsed?: number
+  promptTokenBudget?: number
+  outputBytes?: number
+}
+
+export type AuditEntry = {
+  id: string
+  projectID?: string
+  runID?: string
+  kind: string
+  actor: string
+  target?: string
+  decision?: string
+  detail?: string
+  metadata?: JsonMap
+  createdAt: string
+}
+
+export type RuntimeStatus = {
+  connected: boolean
+  codexCommand: string
+  appServerPID?: number
+  activeSessions: number
+  maxSessions: number
+  activeRuns: number
+  authStatus: string
+  updatedAt: string
 }
 
 export type HistoryEntry = {
@@ -286,8 +315,6 @@ export type Schedule = {
   createdAt: string
   updatedAt: string
 }
-
-export type LoginStart = { type: string; loginID?: string; authUrl?: string; verificationUrl?: string; userCode?: string }
 
 export const defaultAgent: AgentProfile = {
   id: '',

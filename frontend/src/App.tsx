@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Events, Window as WailsWindow } from '@wailsio/runtime'
 import { api } from './api'
 import type {
-  AgentProfile,
+	AgentProfile,
+	AuditEntry,
   ApprovalRequest,
   AuthState,
   BuilderApplyResult,
@@ -11,8 +12,9 @@ import type {
   MCPServer,
   ModelInfo,
   Project,
-  Run,
-  RunEvent,
+	Run,
+	RunEvent,
+	RuntimeStatus,
   Schedule,
   SystemPrompt,
   TerminalResult,
@@ -114,8 +116,8 @@ function UsageMonitor({ auth }: { auth: AuthState }) {
     return () => window.clearInterval(interval)
   }, [])
 
-  if (!rateLimit || !hasUsageData) {
-    const state = auth.status === 'checking' ? 'Checking' : auth.status === 'logged_in' ? 'No data' : 'Sign in'
+	if (!rateLimit || !hasUsageData) {
+		const state = auth.status === 'checking' ? 'Checking Codex' : auth.status === 'logged_in' ? 'No data' : 'Codex offline'
     return <div className="usage-monitor usage-neutral" role="status" aria-label={`Codex usage: ${state}`} title={`Codex usage: ${state}`}><span className="usage-monitor-signal" aria-hidden="true" /><span className="usage-monitor-name">Usage</span><span className="usage-monitor-state">{state}</span></div>
   }
 
@@ -1003,7 +1005,6 @@ function BuilderView({
   models,
   auth,
   onApply,
-  onLogin,
   onOpenWorkflow,
   onStartWorkflow,
   onNotice,
@@ -1013,7 +1014,6 @@ function BuilderView({
   models: ModelInfo[]
   auth: AuthState
   onApply: (proposal: BuilderProposal) => Promise<BuilderApplyResult>
-  onLogin: () => void
   onOpenWorkflow: () => void
   onStartWorkflow: (workflow: WorkflowDefinition) => Promise<void>
   onNotice: (message: string) => void
@@ -1068,7 +1068,7 @@ function BuilderView({
     const value = prompt.trim()
     if (!value || busy) return
     if (auth.status !== 'logged_in') {
-      onLogin()
+      onNotice('Codex is not authenticated. Sign in through the Codex CLI; Centurion does not manage account login.')
       return
     }
     appendMessage('user', value)
@@ -1111,7 +1111,7 @@ function BuilderView({
   const prepareBuild = async () => {
     if (!project || !hasAssistantReply || busy) return
     if (auth.status !== 'logged_in') {
-      onLogin()
+      onNotice('Codex is not authenticated. Sign in through the Codex CLI; Centurion does not manage account login.')
       return
     }
     setBusy(true)
@@ -1178,7 +1178,7 @@ function BuilderView({
     <div className="view-stack builder-page">
       <div className="view-heading builder-heading">
         <div><span className="section-kicker">Configuration assistant</span><h1>Build with Codex</h1><p>Talk through the outcome with a planning lead, then turn the agreed scope into agents and a visual workflow.</p></div>
-        <div className="builder-heading-meta"><span className={`builder-connection ${auth.status === 'logged_in' ? 'online' : ''}`}><span />{auth.status === 'logged_in' ? 'Ready' : 'Sign in required'}</span>{project && <span className="builder-project-name">{project.name}</span>}<div className="builder-mode-switch" role="tablist" aria-label="Builder mode"><button type="button" role="tab" aria-selected={mode === 'planning'} className={mode === 'planning' ? 'active' : ''} onClick={() => setMode('planning')}><span className="builder-mode-dot" />Plan</button><button type="button" role="tab" aria-selected={mode === 'building'} className={mode === 'building' ? 'active' : ''} onClick={() => setMode('building')}><span className="builder-mode-dot" />Build</button></div></div>
+        <div className="builder-heading-meta"><span className={`builder-connection ${auth.status === 'logged_in' ? 'online' : ''}`}><span />{auth.status === 'logged_in' ? 'Codex ready' : 'Codex offline'}</span>{project && <span className="builder-project-name">{project.name}</span>}<div className="builder-mode-switch" role="tablist" aria-label="Builder mode"><button type="button" role="tab" aria-selected={mode === 'planning'} className={mode === 'planning' ? 'active' : ''} onClick={() => setMode('planning')}><span className="builder-mode-dot" />Plan</button><button type="button" role="tab" aria-selected={mode === 'building'} className={mode === 'building' ? 'active' : ''} onClick={() => setMode('building')}><span className="builder-mode-dot" />Build</button></div></div>
       </div>
       {!project ? <div className="empty-state panel-card"><strong>Choose a project first</strong><span>The planning room uses project folders as the safe workspace boundary.</span></div> : <div className="builder-layout">
         <section className="panel-card builder-chat" aria-label={mode === 'planning' ? 'Codex planning room' : 'Codex builder chat'}>
@@ -1245,10 +1245,12 @@ function WindowFrame({ auth }: { auth: AuthState }) {
 function App() {
   const [activeView, setActiveView] = useState<View>('projects')
   const [auth, setAuth] = useState<AuthState>({ status: 'checking', updatedAt: '' })
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({ connected: false, codexCommand: 'codex', activeSessions: 0, maxSessions: 0, activeRuns: 0, authStatus: 'checking', updatedAt: '' })
   const [projects, setProjects] = useState<Project[]>([])
   const [activeProjectID, setActiveProjectID] = useState('')
   const [draftProject, setDraftProject] = useState<Project>(defaultProject)
   const [history, setHistory] = useState<HistoryEntry[]>([])
+  const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([])
   const [historyKind, setHistoryKind] = useState('')
   const [agents, setAgents] = useState<AgentProfile[]>([])
   const [models, setModels] = useState<ModelInfo[]>([])
@@ -1282,14 +1284,45 @@ function App() {
 
   const refreshRuns = () => { void api.listRuns(activeProjectID).then((nextRuns) => { setRuns(nextRuns); setSelectedRunID((current) => nextRuns.some((run) => run.id === current) ? current : nextRuns[0]?.id ?? '') }).catch((error) => announce(errorText(error))) }
   const refreshHistory = (projectID = activeProjectID, kind = historyKind) => { if (!projectID) return; void api.listHistory({ projectID, kind, limit: 100 }).then(setHistory).catch((error) => announce(errorText(error))) }
+  const refreshProjectData = async (projectID: string) => {
+    if (!projectID) return
+    const [agentsResult, workflowsResult, runsResult, schedulesResult, historyResult, auditResult] = await Promise.allSettled([
+      api.listAgents(),
+      api.listWorkflows(),
+      api.listRuns(projectID),
+      api.listSchedules(),
+      api.listHistory({ projectID, limit: 100 }),
+      api.listAudit({ projectID, limit: 100 }),
+    ])
+    if (agentsResult.status === 'fulfilled') {
+      setAgents(agentsResult.value)
+      setSelectedAgentID(agentsResult.value[0]?.id ?? '')
+    }
+    if (workflowsResult.status === 'fulfilled') {
+      setWorkflows(workflowsResult.value)
+      setSelectedWorkflowID(workflowsResult.value[0]?.id ?? '')
+    }
+    if (runsResult.status === 'fulfilled') {
+      setRuns(runsResult.value)
+      setSelectedRunID(runsResult.value[0]?.id ?? '')
+    }
+    if (schedulesResult.status === 'fulfilled') {
+      setSchedules(schedulesResult.value)
+      setDraftSchedule(schedulesResult.value[0] ?? { id: '', name: 'New routine', workflowID: '', cron: '*/30 * * * *', timezone: 'Local', enabled: true, createdAt: '', updatedAt: '' })
+    }
+    if (historyResult.status === 'fulfilled') setHistory(historyResult.value)
+    if (auditResult.status === 'fulfilled') setAuditEntries(auditResult.value)
+    setEvents([])
+  }
 
   useEffect(() => {
     let mounted = true
     const load = async () => {
       setLoading(true)
-      const [authResult, projectsResult, activeProjectResult, agentsResult, promptsResult, workflowsResult, runsResult, schedulesResult] = await Promise.allSettled([api.getAuthState(), api.listProjects(), api.getActiveProject(), api.listAgents(), api.listSystemPrompts(), api.listWorkflows(), api.listRuns(), api.listSchedules()])
+      const [authResult, runtimeResult, projectsResult, activeProjectResult, agentsResult, promptsResult, workflowsResult, runsResult, schedulesResult] = await Promise.allSettled([api.getAuthState(), api.getRuntimeStatus(), api.listProjects(), api.getActiveProject(), api.listAgents(), api.listSystemPrompts(), api.listWorkflows(), api.listRuns(), api.listSchedules()])
       if (!mounted) return
       if (authResult.status === 'fulfilled') setAuth(authResult.value)
+      if (runtimeResult.status === 'fulfilled') setRuntimeStatus(runtimeResult.value)
       if (projectsResult.status === 'fulfilled') setProjects(projectsResult.value)
       if (activeProjectResult.status === 'fulfilled') {
         setActiveProjectID(activeProjectResult.value.id)
@@ -1305,6 +1338,7 @@ function App() {
       if (activeProjectResult.status === 'fulfilled') {
         const projectID = activeProjectResult.value.id
         void api.listHistory({ projectID, limit: 100 }).then(setHistory).catch(() => undefined)
+        void api.listAudit({ projectID, limit: 100 }).then(setAuditEntries).catch(() => undefined)
       }
       void Promise.allSettled([api.listModels(), api.listMCPServers()]).then(([modelsResult, mcpResult]) => {
         if (!mounted) return
@@ -1328,7 +1362,10 @@ function App() {
     listen('approval.requested', (value) => { const approval = eventValue<ApprovalRequest>(value); setApprovals((current) => ({ ...current, [approval.id]: approval })) })
     listen('approval.resolved', (value) => { const decision = eventValue<{ id: string }>(value); setApprovals((current) => { const next = { ...current }; delete next[decision.id]; return next }) })
     listen('scheduler.updated', () => { void api.listSchedules().then(setSchedules).catch(() => undefined) })
-    const interval = window.setInterval(refreshRuns, 7000)
+    const interval = window.setInterval(() => {
+      refreshRuns()
+      void api.getRuntimeStatus().then(setRuntimeStatus).catch(() => undefined)
+    }, 7000)
     return () => { mounted = false; window.clearInterval(interval); cleanups.forEach((cleanup) => cleanup()) }
   }, [])
 
@@ -1359,6 +1396,19 @@ function App() {
 
   const createProject = () => { setDraftProject({ ...defaultProject, name: 'New project' }); setActiveView('projects') }
 
+  const exportProjectSnapshot = async () => {
+    if (!activeProjectID || busy) return
+    setBusy(true)
+    try {
+      const path = await api.exportProjectSnapshot(activeProjectID)
+      announce(`Project snapshot exported to ${path}`)
+    } catch (error) {
+      announce(errorText(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const createWorkflow = () => {
     const nodeID = `node-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
     const workflowID = `workflow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
@@ -1372,7 +1422,7 @@ function App() {
       entryNodeID: nodeID,
       nodes: [{ id: nodeID, type: hasAgent ? 'agent' : 'approval', label: hasAgent ? 'Start with an agent' : 'Start here', agentID: firstAgent?.id, retry: { maxAttempts: 1, backoffSeconds: 0, idempotent: true } }],
       edges: [],
-      globalLimits: { maxDurationSeconds: 3600, maxParallel: 2, maxTurns: 24 },
+      globalLimits: { maxDurationSeconds: 3600, maxParallel: 2, maxTurns: 24, maxPromptTokens: 12000 },
       errorPolicy: 'stop',
       createdAt: '',
       updatedAt: '',
@@ -1424,7 +1474,7 @@ function App() {
       setActiveProjectID(opened.id)
       setDraftProject(opened)
       setProjects((current) => [opened, ...current.filter((project) => project.id !== opened.id)])
-      refreshHistory(opened.id)
+      await refreshProjectData(opened.id)
       setActiveView('office')
       announce(`Opened ${opened.name}.`)
     } catch (error) { announce(errorText(error)) } finally { setBusy(false) }
@@ -1438,7 +1488,7 @@ function App() {
       setProjects((current) => [opened, ...current.filter((project) => project.id !== opened.id)])
       setActiveProjectID(opened.id)
       setDraftProject(opened)
-      refreshHistory(opened.id)
+      await refreshProjectData(opened.id)
       setActiveView('office')
       announce('Project saved and opened.')
     } catch (error) { announce(errorText(error)) } finally { setBusy(false) }
@@ -1455,7 +1505,7 @@ function App() {
       setProjects(nextProjects)
       setActiveProjectID(nextActive.id)
       setDraftProject(nextActive)
-      refreshHistory(nextActive.id)
+      await refreshProjectData(nextActive.id)
       announce('Project deleted.')
     } catch (error) { announce(errorText(error)) } finally { setBusy(false) }
   }
@@ -1513,11 +1563,6 @@ function App() {
     try { await api.resolveApproval({ id: approval.id, decision }); setApprovals((current) => { const next = { ...current }; delete next[approval.id]; return next }); announce(decision === 'approve' || decision === 'accept' ? 'Action approved.' : 'Action declined.') } catch (error) { announce(errorText(error)) }
   }
 
-  const login = async () => {
-    setBusy(true)
-    try { const result = await api.beginChatGPTLogin(); if (result.authUrl) window.open(result.authUrl, '_blank', 'noopener,noreferrer'); announce('ChatGPT login flow opened in your browser.') } catch (error) { announce(errorText(error)) } finally { setBusy(false) }
-  }
-
   const saveSystemPrompt = async (promptID: string, template: string) => {
     setBusy(true)
     try {
@@ -1538,7 +1583,7 @@ function App() {
 
   const renderProjects = () => (
     <div className="view-stack projects-page">
-      <div className="view-heading"><div><span className="section-kicker">Workspace context</span><h1>Projects</h1><p>Open Centurion into a project and keep every run, folder, prompt, and terminal command in one local context.</p></div><button className="button primary" onClick={createProject}>New project</button></div>
+      <div className="view-heading"><div><span className="section-kicker">Workspace context</span><h1>Projects</h1><p>Open Centurion into a project and keep every run, folder, prompt, and terminal command in one local context.</p></div><div className="heading-actions"><button className="button subtle" onClick={() => void exportProjectSnapshot()} disabled={!activeProjectID || busy}>Export snapshot</button><button className="button primary" onClick={createProject}>New project</button></div></div>
       <div className="projects-layout"><section className="project-list panel-card"><div className="project-list-heading"><span className="eyebrow">Your projects</span><span>{projects.length}</span></div>{projects.map((project) => <button type="button" className={`project-list-item ${project.id === activeProjectID ? 'active' : ''} ${project.id === draftProject.id ? 'selected' : ''}`} key={project.id} onClick={() => editProject(project)}><span className="project-list-mark">{project.name.slice(0, 1).toUpperCase()}</span><span className="project-list-copy"><strong>{project.name}</strong><small>{project.folders.length} folder{project.folders.length === 1 ? '' : 's'} · {project.id === activeProjectID ? 'Open now' : 'Local project'}</small></span><span className="project-list-arrow">→</span></button>)}{projects.length === 0 && <div className="empty-state"><strong>No project yet</strong><span>Create one to define the workspace context.</span></div>}</section><ProjectEditor project={draftProject} onChange={setDraftProject} onSave={saveProject} onOpen={() => void openProject(draftProject.id)} onDelete={draftProject.id ? deleteProject : undefined} busy={busy} /></div>
     </div>
   )
@@ -1547,7 +1592,7 @@ function App() {
 
   const renderHistory = () => <HistoryView entries={history} kind={historyKind} onKindChange={setHistoryKind} />
 
-  const renderBuilder = () => <BuilderView project={activeProject} agents={agents} models={models} auth={auth} onApply={applyBuilderProposal} onLogin={() => void login()} onOpenWorkflow={() => setActiveView('workflows')} onStartWorkflow={startRun} onNotice={announce} />
+  const renderBuilder = () => <BuilderView project={activeProject} agents={agents} models={models} auth={auth} onApply={applyBuilderProposal} onOpenWorkflow={() => setActiveView('workflows')} onStartWorkflow={startRun} onNotice={announce} />
 
   const renderOffice = () => (
     <div className="view-stack">
@@ -1561,7 +1606,7 @@ function App() {
           <div className="stage-legend"><span><i className="legend-state working" /> working</span><span><i className="legend-state waiting" /> approval</span><span><i className="legend-state idle" /> idle</span><span className="reduced-note">Text labels accompany every state</span></div>
         </section>
         <aside className="office-inspector">
-          <div className="panel-card account-card"><div className="card-topline"><span className="eyebrow">Codex connection</span><StatusPill value={auth.status === 'logged_in' ? 'Online' : auth.status === 'offline' ? 'Offline' : 'Checking'} tone={auth.status === 'logged_in' ? 'success' : auth.status === 'offline' ? 'warning' : 'neutral'} /></div><h2>{auth.plan ? `${auth.plan} connected` : 'Managed login'}</h2><p>{auth.email ?? 'Use your ChatGPT plan through the Codex App Server. No API key is required.'}</p>{auth.rateLimit && <div className="quota-line"><span>Current window</span><strong>{auth.rateLimit.usedPercent}% used</strong></div>}{auth.status !== 'logged_in' && <button className="button primary full" onClick={login} disabled={busy}>Sign in with ChatGPT</button>}</div>
+          <div className="panel-card account-card"><div className="card-topline"><span className="eyebrow">Codex connection</span><StatusPill value={auth.status === 'logged_in' ? 'Online' : auth.status === 'offline' ? 'Offline' : 'Checking'} tone={auth.status === 'logged_in' ? 'success' : auth.status === 'offline' ? 'warning' : 'neutral'} /></div><h2>{auth.plan ? `${auth.plan} connected` : 'Codex-managed session'}</h2><p>{auth.email ?? 'Centurion uses the Codex CLI session already configured on this computer. It does not create or store a separate account login.'}</p>{auth.rateLimit && <div className="quota-line"><span>Current window</span><strong>{auth.rateLimit.usedPercent}% used</strong></div>}<span className="field-hint">If Codex is offline or unauthenticated, sign in from the Codex CLI and reload Centurion.</span></div>
           <div className="panel-card"><div className="card-topline"><span className="eyebrow">Current run</span><span className="mini-code">{latestRun ? latestRun.id.slice(0, 8) : '—'}</span></div>{latestRun ? <><div className="run-summary"><StatusPill value={statusLabel(latestRun.status)} tone={latestRun.status === 'completed' ? 'success' : latestRun.status === 'failed' ? 'danger' : latestRun.status === 'running' ? 'accent' : 'neutral'} /><span>{formatTime(latestRun.updatedAt)}</span></div><h3>{workflows.find((workflow) => workflow.id === latestRun.workflowID)?.name ?? 'Workflow'}</h3><p className="muted">{latestRun.error ?? (latestRun.currentNodeID ? `Current node: ${latestRun.currentNodeID}` : 'No step selected.')}</p><button className="link-button" onClick={() => { setSelectedRunID(latestRun.id); setActiveView('runs') }}>Open timeline →</button></> : <div className="empty-small"><strong>No recent runs</strong><span>Start a workflow to bring the office to life.</span></div>}</div>
           <div className="panel-card compact-card"><div className="card-topline"><span className="eyebrow">Team</span><button className="link-button" onClick={() => setActiveView('agents')}>Manage</button></div><div className="agent-strip">{agents.slice(0, 5).map((agent) => <button key={agent.id} title={agent.name} onClick={() => { editAgent(agent); setActiveView('agents') }}><AgentAvatar agent={agent} compact /></button>)}</div><span className="muted">{agents.length} profiles stored locally</span></div>
         </aside>
@@ -1579,7 +1624,7 @@ function App() {
   )
 
   const renderRuns = () => (
-    <div className="view-stack"><div className="view-heading"><div><span className="section-kicker">History</span><h1>Runs</h1><p>Open a run to inspect steps, approvals, errors, and results.</p></div><button className="button primary" onClick={() => void startRun()} disabled={!selectedWorkflow || busy}>Run workflow</button></div><div className="runs-layout"><section className="run-list panel-card">{runs.map((run) => <button className={`run-list-item ${run.id === selectedRunID ? 'selected' : ''}`} key={run.id} onClick={() => setSelectedRunID(run.id)}><div><strong>{workflows.find((workflow) => workflow.id === run.workflowID)?.name ?? 'Workflow'}</strong><small>{run.id.slice(0, 12)} · {formatTime(run.startedAt)}</small></div><StatusPill value={statusLabel(run.status)} tone={run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : run.status === 'running' ? 'accent' : 'neutral'} /></button>)}{runs.length === 0 && <div className="empty-state"><strong>No runs</strong><span>The first run will appear here.</span></div>}</section><section className="run-detail panel-card">{selectedRun ? <><div className="card-topline"><span className="eyebrow">Selected run</span><span className="mini-code">{selectedRun.id}</span></div><div className="run-detail-heading"><div><h2>{workflows.find((workflow) => workflow.id === selectedRun.workflowID)?.name ?? 'Workflow'}</h2><p className="muted">Started at {formatTime(selectedRun.startedAt)} · updated at {formatTime(selectedRun.updatedAt)}</p></div><StatusPill value={statusLabel(selectedRun.status)} tone={selectedRun.status === 'completed' ? 'success' : selectedRun.status === 'failed' ? 'danger' : 'accent'} /></div><div className="run-actions">{selectedRun.status === 'running' && <button className="button subtle" onClick={() => void api.pauseRun(selectedRun.id).then(() => announce('Pause requested.')).catch((error) => announce(errorText(error)))}>Pause</button>}{selectedRun.status === 'paused' && <button className="button primary" onClick={() => void api.resumeRun(selectedRun.id).then(() => announce('Run resumed.')).catch((error) => announce(errorText(error)))}>Resume</button>}{['running', 'paused', 'queued'].includes(selectedRun.status) && <button className="button danger-quiet" onClick={() => void api.cancelRun(selectedRun.id).then(() => announce('Cancellation requested.')).catch((error) => announce(errorText(error)))}>Cancel</button>}</div><Timeline events={activeEvents} onOpenRuns={() => undefined} /></> : <div className="empty-state"><strong>Select a run</strong><span>The complete history is available here.</span></div>}</section></div></div>
+    <div className="view-stack"><div className="view-heading"><div><span className="section-kicker">History</span><h1>Runs</h1><p>Open a run to inspect steps, approvals, errors, and results.</p></div><button className="button primary" onClick={() => void startRun()} disabled={!selectedWorkflow || busy}>Run workflow</button></div><div className="runs-layout"><section className="run-list panel-card">{runs.map((run) => <button className={`run-list-item ${run.id === selectedRunID ? 'selected' : ''}`} key={run.id} onClick={() => setSelectedRunID(run.id)}><div><strong>{workflows.find((workflow) => workflow.id === run.workflowID)?.name ?? 'Workflow'}</strong><small>{run.id.slice(0, 12)} · {formatTime(run.startedAt)}</small></div><StatusPill value={statusLabel(run.status)} tone={run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : run.status === 'running' ? 'accent' : 'neutral'} /></button>)}{runs.length === 0 && <div className="empty-state"><strong>No runs</strong><span>The first run will appear here.</span></div>}</section><section className="run-detail panel-card">{selectedRun ? <><div className="card-topline"><span className="eyebrow">Selected run</span><span className="mini-code">{selectedRun.id}</span></div><div className="run-detail-heading"><div><h2>{workflows.find((workflow) => workflow.id === selectedRun.workflowID)?.name ?? 'Workflow'}</h2><p className="muted">Started at {formatTime(selectedRun.startedAt)} · updated at {formatTime(selectedRun.updatedAt)}</p></div><StatusPill value={statusLabel(selectedRun.status)} tone={selectedRun.status === 'completed' ? 'success' : selectedRun.status === 'failed' ? 'danger' : 'accent'} /></div><div className="run-actions">{selectedRun.status === 'running' && <button className="button subtle" onClick={() => void api.pauseRun(selectedRun.id).then(() => announce('Pause requested.')).catch((error) => announce(errorText(error)))}>Pause</button>}{selectedRun.status === 'paused' && <button className="button primary" onClick={() => void api.resumeRun(selectedRun.id).then(() => announce('Run resumed.')).catch((error) => announce(errorText(error)))}>Resume</button>}{['running', 'paused', 'queued'].includes(selectedRun.status) && <button className="button danger-quiet" onClick={() => void api.cancelRun(selectedRun.id).then(() => announce('Cancellation requested.')).catch((error) => announce(errorText(error)))}>Cancel</button>}</div><div className="run-usage-summary" aria-label="Run token usage"><div><span>Prompt budget</span><strong>{(selectedRun.promptTokensUsed ?? 0).toLocaleString()} / {(selectedRun.promptTokenBudget ?? 0).toLocaleString()} est. tokens</strong></div><div><span>Output</span><strong>{(selectedRun.outputBytes ?? 0).toLocaleString()} bytes</strong></div></div><Timeline events={activeEvents} onOpenRuns={() => undefined} /></> : <div className="empty-state"><strong>Select a run</strong><span>The complete history is available here.</span></div>}</section></div></div>
   )
 
   const renderSchedules = () => (
@@ -1603,9 +1648,11 @@ function App() {
     <div className="view-stack">
       <div className="view-heading"><div><span className="eyebrow">Local runtime</span><h1>Settings</h1><p>Managed account, usage limits, and workspace security principles.</p></div></div>
       <div className="settings-grid">
-        <section className="panel-card settings-hero"><span className="eyebrow">ChatGPT account</span><h2>{auth.email ?? 'Not authenticated'}</h2><p>{auth.status === 'logged_in' ? `${auth.plan ?? 'Active plan'} connected through the Codex App Server.` : 'The MVP uses Codex managed login. Tokens and refresh state stay outside Centurion.'}</p><div className="settings-actions">{auth.status === 'logged_in' ? <button className="button danger-quiet" onClick={() => void api.logout().then(() => announce('Session ended.')).catch((error) => announce(errorText(error)))}>Sign out</button> : <button className="button primary" onClick={login} disabled={busy}>Sign in with ChatGPT</button>}</div></section>
+        <section className="panel-card settings-hero"><span className="eyebrow">Codex runtime</span><h2>{auth.email ?? 'Managed by Codex CLI'}</h2><p>{auth.status === 'logged_in' ? `${auth.plan ?? 'Active plan'} is available through the local Codex App Server.` : 'The MVP has no separate Centurion login. Authentication, tokens, and refresh state remain managed by Codex.'}</p><div className="settings-actions"><span className="settings-inline-note">Run <code>codex login</code> outside the app when the Codex session needs attention.</span></div></section>
         <section className="panel-card policy-card"><span className="eyebrow">Default guardrails</span><div className="policy-row"><strong>Workspaces</strong><span>Only roots configured per agent</span></div><div className="policy-row"><strong>Network</strong><span>Disabled by default for coding agents</span></div><div className="policy-row"><strong>Approvals</strong><span>Commands, files, and permissions follow risk</span></div><div className="policy-row"><strong>Usage</strong><span>Automatic runs stop when Codex reports a limit</span></div></section>
         <section className="panel-card policy-card settings-catalog"><span className="eyebrow">Available catalog</span><h2>{models.length || '—'} models</h2><p className="muted">Discovered dynamically through <code>model/list</code>. Availability varies by account; IDs are not hardcoded.</p><div className="model-tags">{models.slice(0, 6).map((model) => <span key={model.id} className="tool-chip">{model.displayName}</span>)}</div></section>
+        <section className="panel-card policy-card"><span className="eyebrow">Local session manager</span><h2>{runtimeStatus.activeSessions}/{runtimeStatus.maxSessions || '—'} logical sessions</h2><p className="muted">All agents share one Codex App Server process and use isolated threads. This prevents one process per agent.</p><div className="policy-row"><strong>Process</strong><span>{runtimeStatus.connected ? `${runtimeStatus.codexCommand} · PID ${runtimeStatus.appServerPID || '—'}` : 'Codex App Server offline'}</span></div><div className="policy-row"><strong>Active runs</strong><span>{runtimeStatus.activeRuns}</span></div><div className="policy-row"><strong>Prompt guard</strong><span>Each workflow has a persisted estimated-token budget.</span></div></section>
+        <section className="panel-card policy-card audit-card"><div className="card-topline"><span className="eyebrow">Security audit</span><span className="mini-code">{auditEntries.length} recent entries</span></div>{auditEntries.length === 0 ? <p className="muted">Approvals, terminal commands, project changes, and exports will appear here.</p> : <div className="audit-list">{auditEntries.slice(0, 8).map((entry) => <div className="audit-row" key={entry.id}><span className="timeline-dot info" /><div><strong>{entry.kind}</strong><small>{entry.detail || entry.target || 'Recorded action'} · {formatTime(entry.createdAt)}</small></div><span>{entry.decision || entry.actor}</span></div>)}</div>}</section>
         <SystemPromptEditor prompts={systemPrompts} onSave={saveSystemPrompt} onReset={resetSystemPrompt} busy={busy} />
       </div>
     </div>
@@ -1619,7 +1666,7 @@ function App() {
       <WindowFrame auth={auth} />
       <div className="app-shell">
       <aside className="side-rail"><div className="brand-lockup"><img className="brand-mark" src="/centurion-icon.png" alt="" aria-hidden="true" /><div><strong>CENTURION</strong><span>agent command center</span></div></div><nav className="main-nav" aria-label="Main navigation">{navItems.map((item) => <button key={item.id} title={item.label} aria-label={item.label} className={activeView === item.id ? 'active' : ''} onClick={() => setActiveView(item.id)}><Icon glyph={item.short} /><span>{item.label}</span></button>)}</nav><div className="rail-footer"><div className={`connection-mark ${auth.status === 'logged_in' ? 'online' : ''}`} /><span>{auth.status === 'logged_in' ? 'Codex connected' : 'Codex waiting'}</span><small>local-first · v0.1</small></div></aside>
-      <main className="main-area"><header className="topbar"><div className="breadcrumb"><span>Centurion</span><b>/</b><strong>{navItems.find((item) => item.id === activeView)?.label}</strong></div><label className="project-switcher"><span>Project</span><select value={activeProjectID} onChange={(event) => void openProject(event.target.value)} disabled={!projects.length}><option value="">Choose a project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label><div className="topbar-right"><span className="system-time">{new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short' })}</span><button className="quick-add" aria-label="Create new agent" onClick={createAgent}><span className="quick-add-icon" aria-hidden="true">+</span><span className="quick-add-label">New agent</span></button></div></header>{loading || auth.status === 'checking' ? <div className="loading-view"><div className="loading-orbit" /><span>{loading ? 'Opening your project…' : 'Confirming ChatGPT login…'}</span></div> : <div className="content-scroll">{approvalList.length > 0 && <section className="approval-tray" aria-live="assertive"><div className="approval-tray-title"><span className="alert-mark">!</span><div><strong>{approvalList.length} approval{approvalList.length === 1 ? '' : 's'} waiting for you</strong><span>Execution is paused until you make an explicit decision.</span></div></div><div className="approval-actions">{approvalList.slice(0, 2).map((approval) => <div className="approval-item" key={approval.id}><span>{approval.title}</span><div><button className="button primary small" onClick={() => void resolveApproval(approval, 'approve')}>Approve</button><button className="button danger-quiet small" onClick={() => void resolveApproval(approval, 'decline')}>Decline</button></div></div>)}</div></section>}{content}</div>}{notice && <div className="toast" role="status">{notice}</div>}</main>
+      <main className="main-area"><header className="topbar"><div className="breadcrumb"><span>Centurion</span><b>/</b><strong>{navItems.find((item) => item.id === activeView)?.label}</strong></div><label className="project-switcher"><span>Project</span><select value={activeProjectID} onChange={(event) => void openProject(event.target.value)} disabled={!projects.length}><option value="">Choose a project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label><div className="topbar-right"><span className="system-time">{new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'short' })}</span><button className="quick-add" aria-label="Create new agent" onClick={createAgent}><span className="quick-add-icon" aria-hidden="true">+</span><span className="quick-add-label">New agent</span></button></div></header>{loading || auth.status === 'checking' ? <div className="loading-view"><div className="loading-orbit" /><span>{loading ? 'Opening your project…' : 'Waiting for the Codex session…'}</span></div> : <div className="content-scroll">{approvalList.length > 0 && <section className="approval-tray" aria-live="assertive"><div className="approval-tray-title"><span className="alert-mark">!</span><div><strong>{approvalList.length} approval{approvalList.length === 1 ? '' : 's'} waiting for you</strong><span>Execution is paused until you make an explicit decision.</span></div></div><div className="approval-actions">{approvalList.slice(0, 2).map((approval) => <div className="approval-item" key={approval.id}><span>{approval.title}</span><div><button className="button primary small" onClick={() => void resolveApproval(approval, 'approve')}>Approve</button><button className="button danger-quiet small" onClick={() => void resolveApproval(approval, 'decline')}>Decline</button></div></div>)}</div></section>}{content}</div>}{notice && <div className="toast" role="status">{notice}</div>}</main>
       </div>
     </div>
   )

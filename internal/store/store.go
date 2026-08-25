@@ -16,6 +16,7 @@ import (
 
 	"github.com/RuanFernandes/centurion/internal/model"
 	"github.com/RuanFernandes/centurion/internal/security"
+	"github.com/google/uuid"
 )
 
 type Store struct {
@@ -107,6 +108,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS agents (
 			id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL DEFAULT '',
 			name TEXT NOT NULL,
 			role TEXT NOT NULL,
 			instructions TEXT NOT NULL DEFAULT '',
@@ -136,6 +138,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS workflows (
 			id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL DEFAULT '',
 			name TEXT NOT NULL,
 			version INTEGER NOT NULL,
 			definition_json TEXT NOT NULL,
@@ -155,7 +158,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			completed_at TEXT,
 			error TEXT NOT NULL DEFAULT '',
 			cancel_requested INTEGER NOT NULL DEFAULT 0,
-			paused INTEGER NOT NULL DEFAULT 0
+			paused INTEGER NOT NULL DEFAULT 0,
+			prompt_tokens_used INTEGER NOT NULL DEFAULT 0,
+			prompt_token_budget INTEGER NOT NULL DEFAULT 0,
+			output_bytes INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS run_steps (
 			run_id TEXT NOT NULL,
@@ -218,8 +224,22 @@ func (s *Store) migrate(ctx context.Context) error {
 			metadata_json TEXT NOT NULL DEFAULT '{}',
 			created_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS audit_log (
+			id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL DEFAULT '',
+			run_id TEXT NOT NULL DEFAULT '',
+			kind TEXT NOT NULL,
+			actor TEXT NOT NULL DEFAULT '',
+			target TEXT NOT NULL DEFAULT '',
+			decision TEXT NOT NULL DEFAULT '',
+			detail TEXT NOT NULL DEFAULT '',
+			metadata_json TEXT NOT NULL DEFAULT '{}',
+			created_at TEXT NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_projects_last_opened ON projects(last_opened_at DESC, updated_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_history_project_created ON history(project_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_project_created ON audit_log(project_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_run_created ON audit_log(run_id, created_at DESC)`,
 	}
 	for index, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -228,6 +248,21 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if err := ensureColumn(ctx, s.db, "runs", "project_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("migrate runs project scope: %w", err)
+	}
+	for _, column := range []struct {
+		table      string
+		name       string
+		definition string
+	}{
+		{table: "agents", name: "project_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "workflows", name: "project_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "runs", name: "prompt_tokens_used", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "runs", name: "prompt_token_budget", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{table: "runs", name: "output_bytes", definition: "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := ensureColumn(ctx, s.db, column.table, column.name, column.definition); err != nil {
+			return fmt.Errorf("migrate %s.%s: %w", column.table, column.name, err)
+		}
 	}
 	return nil
 }
@@ -261,14 +296,14 @@ func (s *Store) seedDefaults(ctx context.Context) error {
 		nowValue := now()
 		agents := []model.AgentProfile{
 			{
-				ID: "agent-architect", Name: "Mara", Role: "Systems architect",
+				ID: "agent-architect", ProjectID: "project-local", Name: "Mara", Role: "Systems architect",
 				Instructions:   "Define a small, safe, and verifiable approach. Return decisions and risks in an objective format.",
 				WorkspaceRoots: []string{cwd}, ToolAllowlist: []string{"files.read", "git.diff"}, ApprovalProfile: "on_request",
 				RoomID: "strategy", AvatarID: "architect", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1200, MaxTurns: 8, MaxAttempts: 2,
 				CreatedAt: nowValue, UpdatedAt: nowValue,
 			},
 			{
-				ID: "agent-builder", Name: "Nico", Role: "Software implementer",
+				ID: "agent-builder", ProjectID: "project-local", Name: "Nico", Role: "Software implementer",
 				Instructions:   "Implement only inside the allowed workspace. Validate changes with tests and report any blocker.",
 				WorkspaceRoots: []string{cwd}, ToolAllowlist: []string{"files.read", "files.write", "shell.test", "git.diff"}, ApprovalProfile: "on_request",
 				RoomID: "workshop", AvatarID: "builder", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1800, MaxTurns: 12, MaxAttempts: 2,
@@ -289,10 +324,10 @@ func (s *Store) seedDefaults(ctx context.Context) error {
 	if workflowCount == 0 {
 		nowValue := now()
 		workflow := model.WorkflowDefinition{
-			ID: "workflow-studio-brief", Name: "Product brief", Version: 1, EntryNodeID: "brief",
+			ID: "workflow-studio-brief", ProjectID: "project-local", Name: "Product brief", Version: 1, EntryNodeID: "brief",
 			Description:  "Supervisor example with parallel execution, a condition, a bounded loop, and approval.",
 			ErrorPolicy:  "stop",
-			GlobalLimits: model.WorkflowLimits{MaxDurationSeconds: 3600, MaxParallel: 2, MaxTurns: 24},
+			GlobalLimits: model.WorkflowLimits{MaxDurationSeconds: 3600, MaxParallel: 2, MaxTurns: 24, MaxPromptTokens: 12000},
 			Nodes: []model.WorkflowNode{
 				{ID: "brief", Type: "agent", Label: "Define direction", AgentID: "agent-architect", TimeoutSeconds: 600, Retry: model.RetryPolicy{MaxAttempts: 2, BackoffSeconds: 2, Idempotent: true}},
 				{ID: "parallel", Type: "parallel", Label: "Open workstreams", Retry: model.RetryPolicy{MaxAttempts: 1}},
@@ -421,10 +456,10 @@ func (s *Store) SaveAgent(ctx context.Context, agent model.AgentProfile) error {
 		agent.UpdatedAt = now()
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO agents (id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
-		agent.ID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, agent.CreatedAt, agent.UpdatedAt)
+		INSERT INTO agents (id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
+		agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, agent.CreatedAt, agent.UpdatedAt)
 	return err
 }
 
@@ -444,7 +479,22 @@ func (s *Store) DeleteAgent(ctx context.Context, id string) error {
 }
 
 func (s *Store) ListAgents(ctx context.Context) ([]model.AgentProfile, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at FROM agents ORDER BY name`)
+	return s.listAgents(ctx, "")
+}
+
+func (s *Store) ListAgentsForProject(ctx context.Context, projectID string) ([]model.AgentProfile, error) {
+	return s.listAgents(ctx, strings.TrimSpace(projectID))
+}
+
+func (s *Store) listAgents(ctx context.Context, projectID string) ([]model.AgentProfile, error) {
+	query := `SELECT id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at FROM agents`
+	args := make([]any, 0, 1)
+	if projectID != "" {
+		query += ` WHERE project_id = ? OR project_id = ''`
+		args = append(args, projectID)
+	}
+	query += ` ORDER BY name`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -461,7 +511,7 @@ func (s *Store) ListAgents(ctx context.Context) ([]model.AgentProfile, error) {
 }
 
 func (s *Store) GetAgent(ctx context.Context, id string) (model.AgentProfile, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at FROM agents WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at FROM agents WHERE id = ?`, id)
 	return scanAgent(row)
 }
 
@@ -483,10 +533,10 @@ func (s *Store) SaveWorkflow(ctx context.Context, workflow model.WorkflowDefinit
 		return fmt.Errorf("encode workflow: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO workflows (id, name, version, definition_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET name=excluded.name, version=excluded.version, definition_json=excluded.definition_json, updated_at=excluded.updated_at`,
-		workflow.ID, workflow.Name, workflow.Version, string(definition), workflow.CreatedAt, workflow.UpdatedAt)
+		INSERT INTO workflows (id, project_id, name, version, definition_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, version=excluded.version, definition_json=excluded.definition_json, updated_at=excluded.updated_at`,
+		workflow.ID, workflow.ProjectID, workflow.Name, workflow.Version, string(definition), workflow.CreatedAt, workflow.UpdatedAt)
 	return err
 }
 
@@ -521,10 +571,10 @@ func (s *Store) ApplyBuilderProposal(ctx context.Context, agents []model.AgentPr
 			updatedAt = createdAt
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO agents (id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
-			agent.ID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, createdAt, updatedAt); err != nil {
+			INSERT INTO agents (id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
+			agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, createdAt, updatedAt); err != nil {
 			return err
 		}
 	}
@@ -535,10 +585,10 @@ func (s *Store) ApplyBuilderProposal(ctx context.Context, agents []model.AgentPr
 			return fmt.Errorf("encode builder workflow: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO workflows (id, name, version, definition_json, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET name=excluded.name, version=excluded.version, definition_json=excluded.definition_json, updated_at=excluded.updated_at`,
-			workflow.ID, workflow.Name, workflow.Version, string(definition), workflow.CreatedAt, workflow.UpdatedAt); err != nil {
+			INSERT INTO workflows (id, project_id, name, version, definition_json, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, version=excluded.version, definition_json=excluded.definition_json, updated_at=excluded.updated_at`,
+			workflow.ID, workflow.ProjectID, workflow.Name, workflow.Version, string(definition), workflow.CreatedAt, workflow.UpdatedAt); err != nil {
 			return err
 		}
 	}
@@ -588,7 +638,22 @@ func (s *Store) GetWorkflow(ctx context.Context, id string) (model.WorkflowDefin
 }
 
 func (s *Store) ListWorkflows(ctx context.Context) ([]model.WorkflowDefinition, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT definition_json FROM workflows ORDER BY updated_at DESC")
+	return s.listWorkflows(ctx, "")
+}
+
+func (s *Store) ListWorkflowsForProject(ctx context.Context, projectID string) ([]model.WorkflowDefinition, error) {
+	return s.listWorkflows(ctx, strings.TrimSpace(projectID))
+}
+
+func (s *Store) listWorkflows(ctx context.Context, projectID string) ([]model.WorkflowDefinition, error) {
+	query := "SELECT definition_json FROM workflows"
+	args := make([]any, 0, 1)
+	if projectID != "" {
+		query += " WHERE project_id = ? OR project_id = ''"
+		args = append(args, projectID)
+	}
+	query += " ORDER BY updated_at DESC"
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -773,6 +838,69 @@ func (s *Store) ListHistory(ctx context.Context, filter model.HistoryFilter) ([]
 	return entries, rows.Err()
 }
 
+func (s *Store) AppendAudit(ctx context.Context, entry model.AuditEntry) error {
+	if strings.TrimSpace(entry.ID) == "" {
+		entry.ID = uuid.NewString()
+	}
+	if strings.TrimSpace(entry.Kind) == "" {
+		return errors.New("audit kind is required")
+	}
+	if entry.CreatedAt == "" {
+		entry.CreatedAt = now()
+	}
+	entry.Actor = truncateRedacted(entry.Actor, 120)
+	entry.Target = truncateRedacted(entry.Target, 500)
+	entry.Decision = truncateRedacted(entry.Decision, 120)
+	entry.Detail = truncateRedacted(entry.Detail, 8000)
+	metadata, err := redactedJSON(entry.Metadata)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO audit_log (id, project_id, run_id, kind, actor, target, decision, detail, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		entry.ID, entry.ProjectID, entry.RunID, truncateRedacted(entry.Kind, 120), entry.Actor, entry.Target, entry.Decision, entry.Detail, metadata, entry.CreatedAt)
+	return err
+}
+
+func (s *Store) ListAudit(ctx context.Context, filter model.AuditFilter) ([]model.AuditEntry, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := "SELECT id, project_id, run_id, kind, actor, target, decision, detail, metadata_json, created_at FROM audit_log WHERE 1=1"
+	args := make([]any, 0, 3)
+	if strings.TrimSpace(filter.ProjectID) != "" {
+		query += " AND project_id = ?"
+		args = append(args, strings.TrimSpace(filter.ProjectID))
+	}
+	if strings.TrimSpace(filter.RunID) != "" {
+		query += " AND run_id = ?"
+		args = append(args, strings.TrimSpace(filter.RunID))
+	}
+	if strings.TrimSpace(filter.Kind) != "" {
+		query += " AND kind = ?"
+		args = append(args, strings.TrimSpace(filter.Kind))
+	}
+	query += " ORDER BY created_at DESC LIMIT " + strconv.Itoa(limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	entries := make([]model.AuditEntry, 0)
+	for rows.Next() {
+		var entry model.AuditEntry
+		var metadata string
+		if err := rows.Scan(&entry.ID, &entry.ProjectID, &entry.RunID, &entry.Kind, &entry.Actor, &entry.Target, &entry.Decision, &entry.Detail, &metadata, &entry.CreatedAt); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(metadata), &entry.Metadata); err != nil {
+			return nil, fmt.Errorf("decode audit metadata: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
 func (s *Store) CreateRun(ctx context.Context, run model.Run) error {
 	input, err := jsonString(run.Input)
 	if err != nil {
@@ -782,8 +910,8 @@ func (s *Store) CreateRun(ctx context.Context, run model.Run) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO runs (id, project_id, workflow_id, status, input_json, output_json, current_node_id, started_at, updated_at, completed_at, error, cancel_requested, paused) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		run.ID, run.ProjectID, run.WorkflowID, run.Status, input, output, run.CurrentNodeID, run.StartedAt, run.UpdatedAt, nullableString(run.CompletedAt), run.Error, boolInt(run.CancelRequested), boolInt(run.Paused))
+	_, err = s.db.ExecContext(ctx, `INSERT INTO runs (id, project_id, workflow_id, status, input_json, output_json, current_node_id, started_at, updated_at, completed_at, error, cancel_requested, paused, prompt_tokens_used, prompt_token_budget, output_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.ProjectID, run.WorkflowID, run.Status, input, output, run.CurrentNodeID, run.StartedAt, run.UpdatedAt, nullableString(run.CompletedAt), run.Error, boolInt(run.CancelRequested), boolInt(run.Paused), run.PromptTokensUsed, run.PromptTokenBudget, run.OutputBytes)
 	return err
 }
 
@@ -796,13 +924,13 @@ func (s *Store) UpdateRun(ctx context.Context, run model.Run) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE runs SET project_id=?, status=?, input_json=?, output_json=?, current_node_id=?, started_at=?, updated_at=?, completed_at=?, error=?, cancel_requested=?, paused=? WHERE id=?`,
-		run.ProjectID, run.Status, input, output, run.CurrentNodeID, run.StartedAt, run.UpdatedAt, nullableString(run.CompletedAt), run.Error, boolInt(run.CancelRequested), boolInt(run.Paused), run.ID)
+	_, err = s.db.ExecContext(ctx, `UPDATE runs SET project_id=?, status=?, input_json=?, output_json=?, current_node_id=?, started_at=?, updated_at=?, completed_at=?, error=?, cancel_requested=?, paused=?, prompt_tokens_used=?, prompt_token_budget=?, output_bytes=? WHERE id=?`,
+		run.ProjectID, run.Status, input, output, run.CurrentNodeID, run.StartedAt, run.UpdatedAt, nullableString(run.CompletedAt), run.Error, boolInt(run.CancelRequested), boolInt(run.Paused), run.PromptTokensUsed, run.PromptTokenBudget, run.OutputBytes, run.ID)
 	return err
 }
 
 func (s *Store) GetRun(ctx context.Context, id string) (model.Run, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, project_id, workflow_id, status, input_json, output_json, current_node_id, started_at, updated_at, completed_at, error, cancel_requested, paused FROM runs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, project_id, workflow_id, status, input_json, output_json, current_node_id, started_at, updated_at, completed_at, error, cancel_requested, paused, prompt_tokens_used, prompt_token_budget, output_bytes FROM runs WHERE id = ?`, id)
 	return scanRun(row)
 }
 
@@ -811,7 +939,7 @@ func (s *Store) ListRuns(ctx context.Context, filter model.RunFilter) ([]model.R
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	query := "SELECT id, project_id, workflow_id, status, input_json, output_json, current_node_id, started_at, updated_at, completed_at, error, cancel_requested, paused FROM runs WHERE 1=1"
+	query := "SELECT id, project_id, workflow_id, status, input_json, output_json, current_node_id, started_at, updated_at, completed_at, error, cancel_requested, paused, prompt_tokens_used, prompt_token_budget, output_bytes FROM runs WHERE 1=1"
 	args := make([]any, 0, 4)
 	if filter.ProjectID != "" {
 		query += " AND project_id = ?"
@@ -936,7 +1064,22 @@ func (s *Store) SaveSchedule(ctx context.Context, schedule model.Schedule) error
 }
 
 func (s *Store) ListSchedules(ctx context.Context) ([]model.Schedule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, workflow_id, cron, timezone, enabled, next_run_at, last_run_at, created_at, updated_at FROM schedules ORDER BY name`)
+	return s.listSchedules(ctx, "")
+}
+
+func (s *Store) ListSchedulesForProject(ctx context.Context, projectID string) ([]model.Schedule, error) {
+	return s.listSchedules(ctx, strings.TrimSpace(projectID))
+}
+
+func (s *Store) listSchedules(ctx context.Context, projectID string) ([]model.Schedule, error) {
+	query := `SELECT s.id, s.name, s.workflow_id, s.cron, s.timezone, s.enabled, s.next_run_at, s.last_run_at, s.created_at, s.updated_at FROM schedules s LEFT JOIN workflows w ON w.id = s.workflow_id`
+	args := make([]any, 0, 1)
+	if projectID != "" {
+		query += ` WHERE w.project_id = ? OR w.project_id = ''`
+		args = append(args, projectID)
+	}
+	query += ` ORDER BY s.name`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1132,7 +1275,7 @@ func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition str
 func scanAgent(scanner interface{ Scan(...any) error }) (model.AgentProfile, error) {
 	var agent model.AgentProfile
 	var roots, tools string
-	err := scanner.Scan(&agent.ID, &agent.Name, &agent.Role, &agent.Instructions, &agent.ModelID, &agent.ReasoningEffort, &roots, &tools, &agent.ApprovalProfile, &agent.RoomID, &agent.AvatarID, &agent.VisualState, &agent.MaxDurationSeconds, &agent.MaxTurns, &agent.MaxAttempts, &agent.MemorySummary, &agent.CreatedAt, &agent.UpdatedAt)
+	err := scanner.Scan(&agent.ID, &agent.ProjectID, &agent.Name, &agent.Role, &agent.Instructions, &agent.ModelID, &agent.ReasoningEffort, &roots, &tools, &agent.ApprovalProfile, &agent.RoomID, &agent.AvatarID, &agent.VisualState, &agent.MaxDurationSeconds, &agent.MaxTurns, &agent.MaxAttempts, &agent.MemorySummary, &agent.CreatedAt, &agent.UpdatedAt)
 	if err != nil {
 		return agent, err
 	}
@@ -1150,7 +1293,7 @@ func scanRun(scanner interface{ Scan(...any) error }) (model.Run, error) {
 	var input, output string
 	var completed sql.NullString
 	var cancelRequested, paused int
-	err := scanner.Scan(&run.ID, &run.ProjectID, &run.WorkflowID, &run.Status, &input, &output, &run.CurrentNodeID, &run.StartedAt, &run.UpdatedAt, &completed, &run.Error, &cancelRequested, &paused)
+	err := scanner.Scan(&run.ID, &run.ProjectID, &run.WorkflowID, &run.Status, &input, &output, &run.CurrentNodeID, &run.StartedAt, &run.UpdatedAt, &completed, &run.Error, &cancelRequested, &paused, &run.PromptTokensUsed, &run.PromptTokenBudget, &run.OutputBytes)
 	if err != nil {
 		return run, err
 	}
@@ -1175,6 +1318,51 @@ func jsonString(value any) (string, error) {
 		return "", err
 	}
 	return string(encoded), nil
+}
+
+func redactedJSON(value any) (string, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	var normalized any
+	if err := json.Unmarshal(encoded, &normalized); err != nil {
+		return "", err
+	}
+	redacted, err := json.Marshal(redactJSONValue(normalized))
+	if err != nil {
+		return "", err
+	}
+	return string(redacted), nil
+}
+
+func redactJSONValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return security.RedactSensitiveText(typed)
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, item := range typed {
+			result[key] = redactJSONValue(item)
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, item := range typed {
+			result[index] = redactJSONValue(item)
+		}
+		return result
+	default:
+		return value
+	}
+}
+
+func truncateRedacted(value string, maxRunes int) string {
+	value = security.RedactSensitiveText(strings.TrimSpace(value))
+	if maxRunes <= 0 || len([]rune(value)) <= maxRunes {
+		return value
+	}
+	return string([]rune(value)[:maxRunes]) + "\n[truncated]"
 }
 
 func nullableString(value string) any {

@@ -17,10 +17,6 @@ export function ApplyBuilderProposal(request: model$0.BuilderApplyRequest): $Can
     return $Call.ByID(3067082167, request);
 }
 
-export function BeginChatGPTLogin(): $CancellablePromise<model$0.LoginStart> {
-    return $Call.ByID(187858003);
-}
-
 export function CancelRun(runID: string): $CancellablePromise<void> {
     return $Call.ByID(56584525, runID);
 }
@@ -61,6 +57,10 @@ export function DeleteWorkflow(workflowID: string): $CancellablePromise<void> {
     return $Call.ByID(3153398872, workflowID);
 }
 
+export function ExportProjectSnapshot(projectID: string): $CancellablePromise<string> {
+    return $Call.ByID(623098869, projectID);
+}
+
 /**
  * GenerateBuilderProposal asks the shared Codex App Server for a declarative
  * proposal. It deliberately has no workspace roots and no tool allowlist, so
@@ -90,8 +90,16 @@ export function GetRunEvents(runID: string, afterSequence: number): $Cancellable
     return $Call.ByID(961779978, runID, afterSequence);
 }
 
+export function GetRuntimeStatus(): $CancellablePromise<model$0.RuntimeStatus> {
+    return $Call.ByID(4176624);
+}
+
 export function ListAgents(): $CancellablePromise<model$0.AgentProfile[] | null> {
     return $Call.ByID(2029619840);
+}
+
+export function ListAudit(filter: model$0.AuditFilter): $CancellablePromise<model$0.AuditEntry[] | null> {
+    return $Call.ByID(2840685313, filter);
 }
 
 export function ListHistory(filter: model$0.HistoryFilter): $CancellablePromise<model$0.HistoryEntry[] | null> {
@@ -132,10 +140,6 @@ export function LoadWorkflow(workflowID: string): $CancellablePromise<model$0.Wo
 
 export function LoginMCPServer(serverID: string): $CancellablePromise<string> {
     return $Call.ByID(4023574586, serverID);
-}
-
-export function Logout(): $CancellablePromise<void> {
-    return $Call.ByID(686857892);
 }
 
 export function PauseRun(runID: string): $CancellablePromise<void> {

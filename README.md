@@ -26,7 +26,7 @@ Centurion turns a collection of prompts into an explicit operating system for ag
 - Define reusable agents with a role, instructions, model, reasoning effort, workspace scope, tools, and access policy.
 - Connect agents, conditions, parallel branches, joins, loops, approvals, tools, and artifacts on a visual workflow canvas.
 - Run workflows through the official Codex App Server over local stdio JSON-RPC.
-- Use the managed ChatGPT login flow instead of putting an API key into Centurion.
+- Reuse the Codex CLI session already configured on the computer; Centurion has no separate account login in the MVP.
 - Pause on sensitive actions, enforce workspace boundaries, and keep an append-only run timeline.
 - Continue after a restart using persisted checkpoints and bounded retry policies.
 - Watch the office mirror real execution states without hiding the underlying text and event stream.
@@ -105,22 +105,42 @@ The main packages are deliberately separated:
 - Wails 3 CLI. This project currently targets the Wails 3 alpha toolchain.
 - Codex CLI installed and available on PATH.
 
-Centurion starts and supervises codex app-server locally. The Codex App Server owns the ChatGPT OAuth lifecycle and token storage; Centurion does not persist ChatGPT tokens directly.
+Centurion starts and supervises codex app-server locally. The Codex CLI/App Server owns the ChatGPT OAuth lifecycle and token storage; Centurion does not persist ChatGPT tokens directly or expose a second login surface.
 
 ## Quick start
 
     git clone https://github.com/RuanFernandes/centurion.git
     Set-Location centurion
     npm --prefix frontend ci
+    codex login
     wails3 dev
 
-On first use, complete the ChatGPT login flow exposed by the application. The selected account determines the available models, reasoning efforts, MCP authentication, usage limits, and rate limits.
+Centurion reuses the Codex session from the local machine. If the runtime reports that it is unauthenticated, run `codex login` in a normal terminal, then reload or restart Centurion. The selected Codex account determines the available models, reasoning efforts, MCP authentication, usage limits, and rate limits.
+
+## Project storage
+
+Centurion is project-first. A project can contain multiple workspace folders, including folders from different repositories. When a project is created or opened, Centurion writes a small `.centurion/project.json` manifest in the first selected folder. Runtime state remains in the per-user SQLite database under `%LOCALAPPDATA%/Centurion`; it is not written into the repository by default.
+
+The manifest is safe to commit when a team wants a portable project definition. Local databases, logs, exports, and transient state are ignored by the generated `.centurion/.gitignore`. Use **Export snapshot** in the Projects view to create a redacted, portable JSON snapshot under `.centurion/exports`.
+
+## Runtime and usage controls
+
+All agents share one supervised local Codex App Server process. Agents are logical sessions/threads managed by Centurion, so a workflow does not start one hidden command window per agent. The session manager enforces a bounded concurrency limit and exposes its status in Settings.
+
+Workflows have a default estimated prompt budget of 12,000 tokens. A workflow can override it with `globalLimits.maxPromptTokens`. Centurion accounts for the system prompt, project context, memory summary, node input, and recent structured outputs before starting each agent turn; a run is blocked when the budget is exhausted. This is an estimate for orchestration control, not a replacement for Codex plan usage or rate-limit reporting.
+
+Run usage, approvals, terminal decisions, project changes, and exports are available in the local security audit view. Sensitive values are redacted before they reach persisted audit metadata.
 
 ## Production build
 
     wails3 build
 
 The Windows executable is written to bin/centurion.exe. The build also regenerates the Windows icon resources from build/appicon.png and embeds them into the executable.
+
+Version tags matching `v*` trigger the Windows release workflow, which publishes a portable `centurion-windows-amd64.zip` artifact. For example:
+
+    git tag v0.1.0-alpha.1
+    git push origin v0.1.0-alpha.1
 
 ## Verification
 

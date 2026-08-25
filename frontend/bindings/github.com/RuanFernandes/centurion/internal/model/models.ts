@@ -3,6 +3,7 @@
 
 export interface AgentProfile {
     "id": string;
+    "projectID"?: string;
     "name": string;
     "role": string;
     "instructions": string;
@@ -52,6 +53,26 @@ export interface ApprovalRequest {
     "itemID"?: string;
     "choices"?: string[] | null;
     "expiresAt"?: string;
+}
+
+export interface AuditEntry {
+    "id": string;
+    "projectID"?: string;
+    "runID"?: string;
+    "kind": string;
+    "actor": string;
+    "target"?: string;
+    "decision"?: string;
+    "detail"?: string;
+    "metadata"?: { [_ in string]?: any } | null;
+    "createdAt": string;
+}
+
+export interface AuditFilter {
+    "projectID"?: string;
+    "runID"?: string;
+    "kind"?: string;
+    "limit"?: number;
 }
 
 export interface AuthState {
@@ -154,14 +175,6 @@ export interface HistoryFilter {
     "limit"?: number;
 }
 
-export interface LoginStart {
-    "type": string;
-    "loginId"?: string;
-    "authUrl"?: string;
-    "verificationUrl"?: string;
-    "userCode"?: string;
-}
-
 export interface MCPServer {
     "id": string;
     "name": string;
@@ -229,6 +242,7 @@ export interface Project {
     "name": string;
     "description"?: string;
     "folders": string[] | null;
+    "manifestPath"?: string;
     "createdAt": string;
     "updatedAt": string;
     "lastOpenedAt"?: string;
@@ -284,6 +298,9 @@ export interface Run {
     "error"?: string;
     "cancelRequested": boolean;
     "paused": boolean;
+    "promptTokensUsed": number;
+    "promptTokenBudget": number;
+    "outputBytes": number;
 }
 
 export interface RunEvent {
@@ -315,6 +332,17 @@ export interface RunUpdateEvent {
     "runID": string;
     "event": string;
     "runStatus"?: string;
+}
+
+export interface RuntimeStatus {
+    "connected": boolean;
+    "codexCommand": string;
+    "appServerPID"?: number;
+    "activeSessions": number;
+    "maxSessions": number;
+    "activeRuns": number;
+    "authStatus": string;
+    "updatedAt": string;
 }
 
 export interface Schedule {
@@ -367,6 +395,7 @@ export interface ValidationIssue {
 
 export interface WorkflowDefinition {
     "id": string;
+    "projectID"?: string;
     "name": string;
     "version": number;
     "description"?: string;
@@ -390,6 +419,7 @@ export interface WorkflowLimits {
     "maxDurationSeconds": number;
     "maxParallel": number;
     "maxTurns": number;
+    "maxPromptTokens": number;
 }
 
 export interface WorkflowNode {

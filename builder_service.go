@@ -63,7 +63,7 @@ func (s *AppService) PlanWithCodex(request model.PlanningRequest) (model.Plannin
 	if err != nil {
 		return model.PlanningResponse{}, fmt.Errorf("load planning project: %w", err)
 	}
-	agents, err := s.store.ListAgents(ctx)
+	agents, err := s.store.ListAgentsForProject(ctx, project.ID)
 	if err != nil {
 		return model.PlanningResponse{}, fmt.Errorf("load planning agents: %w", err)
 	}
@@ -321,7 +321,7 @@ func (s *AppService) GenerateBuilderProposal(request model.BuilderRequest) (mode
 	if err != nil {
 		return model.BuilderResponse{}, fmt.Errorf("load builder project: %w", err)
 	}
-	agents, err := s.store.ListAgents(ctx)
+	agents, err := s.store.ListAgentsForProject(ctx, project.ID)
 	if err != nil {
 		return model.BuilderResponse{}, fmt.Errorf("load builder agents: %w", err)
 	}
@@ -432,6 +432,7 @@ func (s *AppService) ApplyBuilderProposal(request model.BuilderApplyRequest) (mo
 		idMap[draft.TemporaryID] = id
 		profiles = append(profiles, model.AgentProfile{
 			ID:                 id,
+			ProjectID:          project.ID,
 			Name:               draft.Name,
 			Role:               draft.Role,
 			Instructions:       draft.Instructions,
@@ -455,6 +456,7 @@ func (s *AppService) ApplyBuilderProposal(request model.BuilderApplyRequest) (mo
 	if normalized.Workflow != nil {
 		copy := *normalized.Workflow
 		copy.ID = uuid.NewString()
+		copy.ProjectID = project.ID
 		copy.CreatedAt = nowValue
 		copy.UpdatedAt = nowValue
 		for index := range copy.Nodes {
