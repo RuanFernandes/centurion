@@ -507,8 +507,13 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .folder-mark { color: var(--cyan); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 14px; }
 .icon-button { display: grid; flex: 0 0 24px; place-items: center; width: 24px; height: 24px; margin-left: auto; padding: 0; border: 1px solid transparent; border-radius: 4px; color: var(--quiet); background: transparent; cursor: pointer; }
 .icon-button:hover { border-color: #6b3c48; color: var(--red); background: #28181f; }
-.project-folder-add { display: flex; gap: 8px; }
-.project-folder-add input { flex: 1 1 auto; min-width: 0; }
+.project-folder-add { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-width: 0; padding: 11px 12px; border: 1px dashed #2d4868; border-radius: 7px; background: #0b1521; }
+.project-folder-picker-copy { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.project-folder-picker-copy > span:last-child { display: grid; gap: 3px; min-width: 0; }
+.project-folder-picker-copy strong { color: var(--text); font-size: 10px; font-weight: 500; }
+.project-folder-picker-copy small { overflow: hidden; color: var(--quiet); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.folder-picker-icon { display: grid; flex: 0 0 27px; place-items: center; width: 27px; height: 27px; border: 1px solid #3d668f; border-radius: 6px; color: var(--cyan); background: #12253a; font-size: 16px; line-height: 1; }
+.project-folder-picker-button { flex: 0 0 auto; }
 .project-editor-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 4px; border-top: 1px solid var(--line); }
 .project-editor-actions-right { display: flex; gap: 8px; }
 .terminal-page, .history-page { gap: 20px; }
@@ -548,7 +553,7 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 @keyframes terminal-blink { 0%, 45% { opacity: 1; } 46%, 100% { opacity: 0; } }
 @media (max-width: 1180px) { .project-switcher { min-width: 180px; margin-right: 14px; }.project-switcher select { min-width: 130px; }.projects-layout { grid-template-columns: minmax(230px, .75fr) minmax(0, 1.25fr); } }
 @media (max-width: 860px) { .project-switcher { order: 3; width: 100%; margin: 0; }.topbar { flex-wrap: wrap; height: auto; min-height: 56px; padding-top: 9px; padding-bottom: 9px; }.project-switcher select { flex: 1; }.projects-layout { grid-template-columns: 1fr; }.terminal-toolbar { grid-template-columns: 1fr; }.history-filter { width: 100%; }.history-filter button { flex: 1; } }
-@media (max-width: 560px) { .project-editor-actions { align-items: stretch; flex-direction: column; }.project-editor-actions-right { justify-content: stretch; }.project-editor-actions-right .button, .project-editor-actions > .button { flex: 1; }.project-folder-add { align-items: stretch; flex-direction: column; }.terminal-command-row { align-items: stretch; flex-wrap: wrap; }.terminal-command-row input { min-height: 38px; }.terminal-command-row .button { width: calc(100% - 8px); }.history-filter { display: grid; grid-template-columns: repeat(2, 1fr); }.history-filter button:last-child { grid-column: 1 / -1; } }
+@media (max-width: 560px) { .project-editor-actions { align-items: stretch; flex-direction: column; }.project-editor-actions-right { justify-content: stretch; }.project-editor-actions-right .button, .project-editor-actions > .button { flex: 1; }.project-folder-add { align-items: stretch; flex-direction: column; }.project-folder-picker-button { width: 100%; }.terminal-command-row { align-items: stretch; flex-wrap: wrap; }.terminal-command-row input { min-height: 38px; }.terminal-command-row .button { width: calc(100% - 8px); }.history-filter { display: grid; grid-template-columns: repeat(2, 1fr); }.history-filter button:last-child { grid-column: 1 / -1; } }
 
 /* Codex configuration builder */
 .builder-page { gap: 20px; }

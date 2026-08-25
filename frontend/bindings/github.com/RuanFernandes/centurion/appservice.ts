@@ -184,6 +184,14 @@ export function SaveWorkflow(definition: model$0.WorkflowDefinition): $Cancellab
     return $Call.ByID(3881829630, definition);
 }
 
+/**
+ * SelectProjectFolder opens the native folder picker and returns a validated
+ * absolute path. An empty path means the user cancelled the dialog.
+ */
+export function SelectProjectFolder(): $CancellablePromise<string> {
+    return $Call.ByID(1490459351);
+}
+
 export function SetActiveProject(projectID: string): $CancellablePromise<model$0.Project> {
     return $Call.ByID(3066739793, projectID);
 }

@@ -50,6 +50,7 @@ export const api = {
   listWorkflows: () => resolve<WorkflowDefinition[]>(GeneratedAppService.ListWorkflows()),
   listProjects: () => resolve<Project[]>(GeneratedAppService.ListProjects()),
   getActiveProject: () => resolve<Project>(GeneratedAppService.GetActiveProject()),
+  selectProjectFolder: () => resolve<string>(GeneratedAppService.SelectProjectFolder()),
   createProject: (project: Project) => resolve<Project>(GeneratedAppService.CreateProject(project)),
   updateProject: (project: Project) => resolve<Project>(GeneratedAppService.UpdateProject(project)),
   setActiveProject: (projectID: string) => resolve<Project>(GeneratedAppService.SetActiveProject(projectID)),

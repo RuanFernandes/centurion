@@ -21,12 +21,14 @@ import (
 	"github.com/RuanFernandes/centurion/internal/security"
 	"github.com/RuanFernandes/centurion/internal/store"
 	"github.com/google/uuid"
+	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 type AppService struct {
 	store    *store.Store
 	codex    *codex.AppServer
 	executor *orchestrator.Executor
+	app      *application.App
 
 	mu             sync.RWMutex
 	emitter        func(string, any)
@@ -67,6 +69,12 @@ func (s *AppService) setEmitter(emitter func(string, any)) {
 	s.emitter = emitter
 	s.mu.Unlock()
 	s.emitAuth()
+}
+
+func (s *AppService) setApp(app *application.App) {
+	s.mu.Lock()
+	s.app = app
+	s.mu.Unlock()
 }
 
 func (s *AppService) Connect(ctx context.Context) {
@@ -410,6 +418,40 @@ func (s *AppService) GetActiveProject() (model.Project, error) {
 		return model.Project{}, err
 	}
 	return withManifestPath(project), nil
+}
+
+// SelectProjectFolder opens the native folder picker and returns a validated
+// absolute path. An empty path means the user cancelled the dialog.
+func (s *AppService) SelectProjectFolder() (string, error) {
+	s.mu.RLock()
+	app := s.app
+	s.mu.RUnlock()
+	if app == nil {
+		return "", errors.New("desktop window is unavailable")
+	}
+
+	dialog := app.Dialog.OpenFile().
+		CanChooseDirectories(true).
+		CanChooseFiles(false).
+		SetTitle("Select project folder").
+		SetMessage("Choose a local folder to add to this project.").
+		SetButtonText("Choose folder")
+	if window := app.Window.Current(); window != nil {
+		dialog.AttachToWindow(window)
+	}
+
+	folder, err := dialog.PromptForSingleSelection()
+	if err != nil {
+		return "", fmt.Errorf("select project folder: %w", err)
+	}
+	if strings.TrimSpace(folder) == "" {
+		return "", nil
+	}
+	normalized, err := security.NormalizeRoots([]string{folder})
+	if err != nil {
+		return "", fmt.Errorf("validate project folder: %w", err)
+	}
+	return normalized[0], nil
 }
 
 func (s *AppService) CreateProject(project model.Project) (model.Project, error) {

@@ -934,6 +934,7 @@ function ProjectEditor({
   onSave,
   onOpen,
   onDelete,
+  onChooseFolder,
   busy,
 }: {
   project: Project
@@ -941,15 +942,22 @@ function ProjectEditor({
   onSave: () => void
   onOpen: () => void
   onDelete?: () => void
+  onChooseFolder: () => Promise<string | undefined>
   busy: boolean
 }) {
-  const [folderDraft, setFolderDraft] = useState('')
+  const [selectingFolder, setSelectingFolder] = useState(false)
   const update = <K extends keyof Project>(key: K, value: Project[K]) => onChange({ ...project, [key]: value })
-  const addFolder = () => {
-    const folder = folderDraft.trim()
-    if (!folder || project.folders.includes(folder)) return
-    update('folders', [...project.folders, folder])
-    setFolderDraft('')
+  const chooseFolder = async () => {
+    if (selectingFolder || busy) return
+    setSelectingFolder(true)
+    try {
+      const folder = await onChooseFolder()
+      if (!folder) return
+      const alreadyAdded = project.folders.some((existing) => existing.toLowerCase() === folder.toLowerCase())
+      if (!alreadyAdded) update('folders', [...project.folders, folder])
+    } finally {
+      setSelectingFolder(false)
+    }
   }
   const removeFolder = (folder: string) => update('folders', project.folders.filter((item) => item !== folder))
 
@@ -961,8 +969,8 @@ function ProjectEditor({
       <label className="field"><span>Description</span><input value={project.description ?? ''} onChange={(event) => update('description', event.target.value)} placeholder="What belongs here?" /></label>
     </div>
     <div className="field project-folders-field"><span className="field-heading">Project folders</span><span className="field-hint">Agents use these folders as their workspace boundary. The terminal starts in one selected folder.</span>
-      <div className="project-folder-list">{project.folders.map((folder) => <div className="project-folder-row" key={folder}><span className="folder-mark" aria-hidden="true">/</span><code title={folder}>{folder}</code><button type="button" className="icon-button" onClick={() => removeFolder(folder)} aria-label={`Remove ${folder}`}>×</button></div>)}{project.folders.length === 0 && <div className="empty-small"><strong>No folders yet</strong><span>Add at least one absolute folder path.</span></div>}</div>
-      <div className="project-folder-add"><input value={folderDraft} onChange={(event) => setFolderDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addFolder() } }} placeholder="C:\\work\\repository" aria-label="Folder path" /><button type="button" className="button subtle" onClick={addFolder}>Add folder</button></div>
+      <div className="project-folder-list">{project.folders.map((folder) => <div className="project-folder-row" key={folder}><span className="folder-mark" aria-hidden="true">/</span><code title={folder}>{folder}</code><button type="button" className="icon-button" onClick={() => removeFolder(folder)} aria-label={`Remove ${folder}`}>×</button></div>)}{project.folders.length === 0 && <div className="empty-small"><strong>No folders yet</strong><span>Choose at least one local folder for this project.</span></div>}</div>
+      <div className="project-folder-add"><div className="project-folder-picker-copy"><span className="folder-picker-icon" aria-hidden="true">+</span><span><strong>Add a workspace folder</strong><small>Choose a folder from Windows Explorer.</small></span></div><button type="button" className="button subtle project-folder-picker-button" onClick={() => void chooseFolder()} disabled={busy || selectingFolder} aria-busy={selectingFolder}>{selectingFolder ? 'Opening…' : 'Choose folder'}</button></div>
     </div>
     <div className="project-editor-actions"><button type="button" className="button subtle" onClick={onOpen} disabled={!project.id}>Open project</button><div className="project-editor-actions-right">{onDelete && <button type="button" className="button danger-quiet" onClick={onDelete} disabled={busy}>Delete</button>}<button type="button" className="button primary" onClick={onSave} disabled={busy || !project.name.trim() || project.folders.length === 0}>{busy ? 'Saving…' : 'Save project'}</button></div></div>
   </section>
@@ -1800,6 +1808,16 @@ function App() {
     } catch (error) { announce(errorText(error)) } finally { setBusy(false) }
   }
 
+  const chooseProjectFolder = async () => {
+    try {
+      const folder = await api.selectProjectFolder()
+      return folder || undefined
+    } catch (error) {
+      announce(errorText(error))
+      return undefined
+    }
+  }
+
   const deleteProject = async () => {
     if (!draftProject.id) return
     if (!window.confirm(`Delete project “${draftProject.name}”?`)) return
@@ -1890,7 +1908,7 @@ function App() {
   const renderProjects = () => (
     <div className="view-stack projects-page">
       <div className="view-heading"><div><span className="section-kicker">Workspace context</span><h1>Projects</h1><p>Open Centurion into a project and keep every run, folder, prompt, and terminal command in one local context.</p></div><div className="heading-actions"><button className="button subtle" onClick={() => void exportProjectSnapshot()} disabled={!activeProjectID || busy}>Export snapshot</button><button className="button primary" onClick={createProject}>New project</button></div></div>
-      <div className="projects-layout"><section className="project-list panel-card"><div className="project-list-heading"><span className="eyebrow">Your projects</span><span>{projects.length}</span></div>{projects.map((project) => <button type="button" className={`project-list-item ${project.id === activeProjectID ? 'active' : ''} ${project.id === draftProject.id ? 'selected' : ''}`} key={project.id} onClick={() => editProject(project)}><span className="project-list-mark">{project.name.slice(0, 1).toUpperCase()}</span><span className="project-list-copy"><strong>{project.name}</strong><small>{project.folders.length} folder{project.folders.length === 1 ? '' : 's'} · {project.id === activeProjectID ? 'Open now' : 'Local project'}</small></span><span className="project-list-arrow">→</span></button>)}{projects.length === 0 && <div className="empty-state"><strong>No project yet</strong><span>Create one to define the workspace context.</span></div>}</section><ProjectEditor project={draftProject} onChange={setDraftProject} onSave={saveProject} onOpen={() => void openProject(draftProject.id)} onDelete={draftProject.id ? deleteProject : undefined} busy={busy} /></div>
+      <div className="projects-layout"><section className="project-list panel-card"><div className="project-list-heading"><span className="eyebrow">Your projects</span><span>{projects.length}</span></div>{projects.map((project) => <button type="button" className={`project-list-item ${project.id === activeProjectID ? 'active' : ''} ${project.id === draftProject.id ? 'selected' : ''}`} key={project.id} onClick={() => editProject(project)}><span className="project-list-mark">{project.name.slice(0, 1).toUpperCase()}</span><span className="project-list-copy"><strong>{project.name}</strong><small>{project.folders.length} folder{project.folders.length === 1 ? '' : 's'} · {project.id === activeProjectID ? 'Open now' : 'Local project'}</small></span><span className="project-list-arrow">→</span></button>)}{projects.length === 0 && <div className="empty-state"><strong>No project yet</strong><span>Create one to define the workspace context.</span></div>}</section><ProjectEditor project={draftProject} onChange={setDraftProject} onSave={saveProject} onOpen={() => void openProject(draftProject.id)} onDelete={draftProject.id ? deleteProject : undefined} onChooseFolder={chooseProjectFolder} busy={busy} /></div>
     </div>
   )
 

@@ -80,6 +80,7 @@ func main() {
 		},
 	})
 
+	service.setApp(app)
 	service.setEmitter(func(name string, payload any) {
 		app.Event.Emit(name, payload)
 	})
