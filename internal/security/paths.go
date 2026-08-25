@@ -124,9 +124,17 @@ func ApprovalPolicy(profile string) string {
 	switch strings.ToLower(strings.TrimSpace(profile)) {
 	case "never", "autonomous":
 		return "never"
-	case "trusted", "unless_trusted":
-		return "unlessTrusted"
+	case "untrusted":
+		return "untrusted"
+	case "trusted", "unless_trusted", "unless-trusted":
+		// Keep the legacy Centurion profile meaningful with the current App
+		// Server protocol. The old unlessTrusted value was renamed to untrusted.
+		return "untrusted"
+	case "granular":
+		return "granular"
+	case "on_request", "on-request", "onrequest", "approval", "approval_required":
+		return "on-request"
 	default:
-		return "onRequest"
+		return "on-request"
 	}
 }

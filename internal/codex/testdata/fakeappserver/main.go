@@ -37,6 +37,18 @@ func main() {
 		case "mcpServerStatus/list":
 			respond(request.ID, map[string]any{"data": []any{}})
 		case "thread/start":
+			var params map[string]any
+			if err := json.Unmarshal(request.Params, &params); err != nil {
+				respondError(request.ID, -32600, "invalid thread/start params")
+				continue
+			}
+			approvalPolicy, _ := params["approvalPolicy"].(string)
+			switch approvalPolicy {
+			case "untrusted", "on-request", "granular", "never":
+			default:
+				respondError(request.ID, -32600, fmt.Sprintf("invalid approval policy %q", approvalPolicy))
+				continue
+			}
 			respond(request.ID, map[string]any{"thread": map[string]any{"id": "fake-thread-1"}})
 		case "thread/resume", "turn/interrupt":
 			respond(request.ID, map[string]any{})
@@ -54,6 +66,10 @@ func main() {
 
 func respond(id json.RawMessage, result any) {
 	write(map[string]any{"id": id, "result": result})
+}
+
+func respondError(id json.RawMessage, code int, message string) {
+	write(map[string]any{"id": id, "error": map[string]any{"code": code, "message": message}})
 }
 
 func notify(method string, params any) {

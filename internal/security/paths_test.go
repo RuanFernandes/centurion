@@ -38,3 +38,26 @@ func TestRedactSensitiveText(t *testing.T) {
 		}
 	}
 }
+
+func TestApprovalPolicyUsesCurrentAppServerVariants(t *testing.T) {
+	tests := map[string]string{
+		"":                  "on-request",
+		"on_request":        "on-request",
+		"on-request":        "on-request",
+		"onRequest":         "on-request",
+		"approval":          "on-request",
+		"approval_required": "on-request",
+		"trusted":           "untrusted",
+		"unless_trusted":    "untrusted",
+		"unless-trusted":    "untrusted",
+		"untrusted":         "untrusted",
+		"granular":          "granular",
+		"autonomous":        "never",
+		"never":             "never",
+	}
+	for profile, expected := range tests {
+		if got := ApprovalPolicy(profile); got != expected {
+			t.Errorf("ApprovalPolicy(%q) = %q, want %q", profile, got, expected)
+		}
+	}
+}
