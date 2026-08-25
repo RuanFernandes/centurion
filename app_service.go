@@ -435,6 +435,9 @@ func (s *AppService) CreateProject(project model.Project) (model.Project, error)
 	if err := s.store.SaveProject(ctx, project); err != nil {
 		return model.Project{}, err
 	}
+	if err := s.store.EnsureProjectConfig(ctx, project.ID); err != nil {
+		return model.Project{}, fmt.Errorf("create project config: %w", err)
+	}
 	_ = s.store.AppendHistory(ctx, model.HistoryEntry{
 		ID:        uuid.NewString(),
 		ProjectID: project.ID,
@@ -476,6 +479,9 @@ func (s *AppService) UpdateProject(project model.Project) (model.Project, error)
 	project.ManifestPath = manifestPath
 	if err := s.store.SaveProject(ctx, project); err != nil {
 		return model.Project{}, err
+	}
+	if err := s.store.EnsureProjectConfig(ctx, project.ID); err != nil {
+		return model.Project{}, fmt.Errorf("update project config: %w", err)
 	}
 	_ = s.store.AppendAudit(ctx, model.AuditEntry{ProjectID: project.ID, Kind: "project.updated", Actor: "user", Target: project.ID, Detail: "Project settings updated", Metadata: map[string]any{"folders": project.Folders}, CreatedAt: now()})
 	return project, nil

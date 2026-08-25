@@ -10,17 +10,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/RuanFernandes/centurion/internal/model"
+	projectmanifest "github.com/RuanFernandes/centurion/internal/project"
 	"github.com/RuanFernandes/centurion/internal/security"
 	"github.com/google/uuid"
 )
 
 type Store struct {
-	db *sql.DB
+	db       *sql.DB
+	configMu sync.Mutex
 }
 
 const (
@@ -272,92 +275,397 @@ func (s *Store) seedDefaults(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM projects").Scan(&projectCount); err != nil {
 		return err
 	}
-	if projectCount == 0 {
-		cwd, _ := os.Getwd()
-		projectName := filepath.Base(cwd)
-		if projectName == "." || projectName == string(filepath.Separator) || projectName == "" {
-			projectName = "Local project"
+	firstInstall := projectCount == 0
+	var project model.Project
+	if firstInstall {
+		var err error
+		project, err = initialProject()
+		if err != nil {
+			return err
 		}
-		project := model.Project{ID: "project-local", Name: projectName, Folders: []string{cwd}, CreatedAt: now(), UpdatedAt: now(), LastOpenedAt: now()}
 		if err := s.SaveProject(ctx, project); err != nil {
 			return err
 		}
 		if err := s.setSettingString(ctx, activeProjectSettingKey, project.ID); err != nil {
 			return err
 		}
+	} else {
+		var err error
+		project, err = s.GetActiveProject(ctx)
+		if err != nil {
+			return fmt.Errorf("load active project for startup: %w", err)
+		}
 	}
 
-	var count int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM agents").Scan(&count); err != nil {
-		return err
-	}
-	if count == 0 {
-		cwd, _ := os.Getwd()
-		nowValue := now()
-		agents := []model.AgentProfile{
-			{
-				ID: "agent-architect", ProjectID: "project-local", Name: "Mara", Role: "Systems architect",
-				Instructions:   "Define a small, safe, and verifiable approach. Return decisions and risks in an objective format.",
-				WorkspaceRoots: []string{cwd}, ToolAllowlist: []string{"files.read", "git.diff"}, ApprovalProfile: "on_request",
-				RoomID: "strategy", AvatarID: "architect", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1200, MaxTurns: 8, MaxAttempts: 2,
-				CreatedAt: nowValue, UpdatedAt: nowValue,
-			},
-			{
-				ID: "agent-builder", ProjectID: "project-local", Name: "Nico", Role: "Software implementer",
-				Instructions:   "Implement only inside the allowed workspace. Validate changes with tests and report any blocker.",
-				WorkspaceRoots: []string{cwd}, ToolAllowlist: []string{"files.read", "files.write", "shell.test", "git.diff"}, ApprovalProfile: "on_request",
-				RoomID: "workshop", AvatarID: "builder", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1800, MaxTurns: 12, MaxAttempts: 2,
-				CreatedAt: nowValue, UpdatedAt: nowValue,
-			},
+	if firstInstall {
+		exists, err := projectConfigExists(project)
+		if err != nil {
+			return err
 		}
-		for _, agent := range agents {
-			if err := s.SaveAgent(ctx, agent); err != nil {
+		if !exists {
+			if err := s.seedDefaultCatalog(ctx, project); err != nil {
 				return err
 			}
 		}
 	}
-
-	var workflowCount int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM workflows").Scan(&workflowCount); err != nil {
+	if err := s.syncAllProjectConfigs(ctx); err != nil {
 		return err
 	}
-	if workflowCount == 0 {
-		nowValue := now()
-		workflow := model.WorkflowDefinition{
-			ID: "workflow-studio-brief", ProjectID: "project-local", Name: "Product brief", Version: 1, EntryNodeID: "brief",
-			Description:  "Supervisor example with parallel execution, a condition, a bounded loop, and approval.",
-			ErrorPolicy:  "stop",
-			GlobalLimits: model.WorkflowLimits{MaxDurationSeconds: 3600, MaxParallel: 2, MaxTurns: 24, MaxPromptTokens: 12000},
-			Nodes: []model.WorkflowNode{
-				{ID: "brief", Type: "agent", Label: "Define direction", AgentID: "agent-architect", TimeoutSeconds: 600, Retry: model.RetryPolicy{MaxAttempts: 2, BackoffSeconds: 2, Idempotent: true}},
-				{ID: "parallel", Type: "parallel", Label: "Open workstreams", Retry: model.RetryPolicy{MaxAttempts: 1}},
-				{ID: "build", Type: "agent", Label: "Build", AgentID: "agent-builder", TimeoutSeconds: 900, Retry: model.RetryPolicy{MaxAttempts: 2, BackoffSeconds: 4, Idempotent: false}},
-				{ID: "review", Type: "agent", Label: "Review", AgentID: "agent-architect", TimeoutSeconds: 600, Retry: model.RetryPolicy{MaxAttempts: 2, BackoffSeconds: 3, Idempotent: true}},
-				{ID: "join", Type: "join", Label: "Consolidate", Retry: model.RetryPolicy{MaxAttempts: 1}},
-				{ID: "quality", Type: "condition", Label: "Quality approved", Condition: "truthy:review.approved", Retry: model.RetryPolicy{MaxAttempts: 1}},
-				{ID: "loop", Type: "loop", Label: "Iterate corrections", MaxIterations: 2, Config: map[string]any{"onExhausted": "approval"}, Retry: model.RetryPolicy{MaxAttempts: 1}},
-				{ID: "approval", Type: "approval", Label: "Approve publication", Retry: model.RetryPolicy{MaxAttempts: 1}},
-				{ID: "artifact", Type: "artifact", Label: "Record result", ArtifactPath: "", Retry: model.RetryPolicy{MaxAttempts: 1}},
-			},
-			Edges: []model.WorkflowEdge{
-				{ID: "e1", From: "brief", To: "parallel"},
-				{ID: "e2", From: "parallel", To: "build"},
-				{ID: "e3", From: "parallel", To: "review"},
-				{ID: "e4", From: "build", To: "join"},
-				{ID: "e5", From: "review", To: "join"},
-				{ID: "e6", From: "join", To: "quality"},
-				{ID: "e7", From: "quality", To: "loop", Condition: "equals:review.approved:false"},
-				{ID: "e8", From: "quality", To: "approval", Condition: "equals:review.approved:true"},
-				{ID: "e9", From: "loop", To: "quality"},
-				{ID: "e10", From: "approval", To: "artifact"},
-			},
-			CreatedAt: nowValue, UpdatedAt: nowValue,
+	if err := s.migrateLegacyLanguage(ctx); err != nil {
+		return err
+	}
+	return s.syncAllProjectConfigs(ctx)
+}
+
+func initialProject() (model.Project, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return model.Project{}, fmt.Errorf("resolve initial project folder: %w", err)
+	}
+	manifestPath := filepath.Join(cwd, projectmanifest.DirectoryName, projectmanifest.ManifestName)
+	if _, statErr := os.Stat(manifestPath); statErr == nil {
+		manifest, readErr := projectmanifest.ReadManifest(manifestPath)
+		if readErr != nil {
+			return model.Project{}, fmt.Errorf("read existing project manifest: %w", readErr)
 		}
-		if err := s.SaveWorkflow(ctx, workflow); err != nil {
+		return model.Project{ID: manifest.ProjectID, Name: manifest.Name, Description: manifest.Description, Folders: manifest.Folders, CreatedAt: now(), UpdatedAt: manifest.UpdatedAt, LastOpenedAt: now()}, nil
+	} else if !os.IsNotExist(statErr) {
+		return model.Project{}, fmt.Errorf("inspect initial project manifest: %w", statErr)
+	}
+	projectName := filepath.Base(cwd)
+	if projectName == "." || projectName == string(filepath.Separator) || projectName == "" {
+		projectName = "Local project"
+	}
+	current := now()
+	return model.Project{ID: "project-local", Name: projectName, Folders: []string{cwd}, CreatedAt: current, UpdatedAt: current, LastOpenedAt: current}, nil
+}
+
+func (s *Store) seedDefaultCatalog(ctx context.Context, project model.Project) error {
+	nowValue := now()
+	roots := append([]string(nil), project.Folders...)
+	agents := []model.AgentProfile{
+		{
+			ID: "agent-architect", ProjectID: project.ID, Name: "Mara", Role: "Systems architect",
+			Instructions:   "Define a small, safe, and verifiable approach. Return decisions and risks in an objective format.",
+			WorkspaceRoots: roots, ToolAllowlist: []string{"files.read", "git.diff"}, ApprovalProfile: "on_request",
+			RoomID: "strategy", AvatarID: "architect", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1200, MaxTurns: 8, MaxAttempts: 2,
+			CreatedAt: nowValue, UpdatedAt: nowValue,
+		},
+		{
+			ID: "agent-builder", ProjectID: project.ID, Name: "Nico", Role: "Software implementer",
+			Instructions:   "Implement only inside the allowed workspace. Validate changes with tests and report any blocker.",
+			WorkspaceRoots: roots, ToolAllowlist: []string{"files.read", "files.write", "shell.test", "git.diff"}, ApprovalProfile: "on_request",
+			RoomID: "workshop", AvatarID: "builder", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1800, MaxTurns: 12, MaxAttempts: 2,
+			CreatedAt: nowValue, UpdatedAt: nowValue,
+		},
+	}
+	for _, agent := range agents {
+		if err := s.SaveAgent(ctx, agent); err != nil {
 			return err
 		}
 	}
-	return s.migrateLegacyLanguage(ctx)
+
+	workflow := model.WorkflowDefinition{
+		ID: "workflow-studio-brief", ProjectID: project.ID, Name: "Product brief", Version: 1, EntryNodeID: "brief",
+		Description:  "Supervisor example with parallel execution, a condition, a bounded loop, and approval.",
+		ErrorPolicy:  "stop",
+		GlobalLimits: model.WorkflowLimits{MaxDurationSeconds: 3600, MaxParallel: 2, MaxTurns: 24, MaxPromptTokens: 12000},
+		Nodes: []model.WorkflowNode{
+			{ID: "brief", Type: "agent", Label: "Define direction", AgentID: "agent-architect", TimeoutSeconds: 600, Retry: model.RetryPolicy{MaxAttempts: 2, BackoffSeconds: 2, Idempotent: true}},
+			{ID: "parallel", Type: "parallel", Label: "Open workstreams", Retry: model.RetryPolicy{MaxAttempts: 1}},
+			{ID: "build", Type: "agent", Label: "Build", AgentID: "agent-builder", TimeoutSeconds: 900, Retry: model.RetryPolicy{MaxAttempts: 2, BackoffSeconds: 4, Idempotent: false}},
+			{ID: "review", Type: "agent", Label: "Review", AgentID: "agent-architect", TimeoutSeconds: 600, Retry: model.RetryPolicy{MaxAttempts: 2, BackoffSeconds: 3, Idempotent: true}},
+			{ID: "join", Type: "join", Label: "Consolidate", Retry: model.RetryPolicy{MaxAttempts: 1}},
+			{ID: "quality", Type: "condition", Label: "Quality approved", Condition: "truthy:review.approved", Retry: model.RetryPolicy{MaxAttempts: 1}},
+			{ID: "loop", Type: "loop", Label: "Iterate corrections", MaxIterations: 2, Config: map[string]any{"onExhausted": "approval"}, Retry: model.RetryPolicy{MaxAttempts: 1}},
+			{ID: "approval", Type: "approval", Label: "Approve publication", Retry: model.RetryPolicy{MaxAttempts: 1}},
+			{ID: "artifact", Type: "artifact", Label: "Record result", ArtifactPath: "", Retry: model.RetryPolicy{MaxAttempts: 1}},
+		},
+		Edges: []model.WorkflowEdge{
+			{ID: "e1", From: "brief", To: "parallel"},
+			{ID: "e2", From: "parallel", To: "build"},
+			{ID: "e3", From: "parallel", To: "review"},
+			{ID: "e4", From: "build", To: "join"},
+			{ID: "e5", From: "review", To: "join"},
+			{ID: "e6", From: "join", To: "quality"},
+			{ID: "e7", From: "quality", To: "loop", Condition: "equals:review.approved:false"},
+			{ID: "e8", From: "quality", To: "approval", Condition: "equals:review.approved:true"},
+			{ID: "e9", From: "loop", To: "quality"},
+			{ID: "e10", From: "approval", To: "artifact"},
+		},
+		CreatedAt: nowValue, UpdatedAt: nowValue,
+	}
+	if err := s.SaveWorkflow(ctx, workflow); err != nil {
+		return err
+	}
+	return nil
+}
+
+func projectConfigExists(project model.Project) (bool, error) {
+	path, err := projectmanifest.ConfigPath(project.Folders)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect project config: %w", err)
+	}
+	if info.IsDir() {
+		return false, fmt.Errorf("project config path is a directory: %s", path)
+	}
+	return true, nil
+}
+
+func (s *Store) syncAllProjectConfigs(ctx context.Context) error {
+	projects, err := s.ListProjects(ctx)
+	if err != nil {
+		return fmt.Errorf("list projects for config sync: %w", err)
+	}
+	for _, project := range projects {
+		if err := s.syncProjectConfig(ctx, project); err != nil {
+			return fmt.Errorf("sync project %s config: %w", project.ID, err)
+		}
+	}
+	return nil
+}
+
+// EnsureProjectConfig creates the project-owned catalog when a project is
+// created or moved. Existing config is never overwritten by this method.
+func (s *Store) EnsureProjectConfig(ctx context.Context, projectID string) error {
+	project, err := s.GetProject(ctx, strings.TrimSpace(projectID))
+	if err != nil {
+		return err
+	}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	exists, err := projectConfigExists(project)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return s.writeProjectConfigLocked(ctx, project)
+}
+
+// LoadProjectConfig makes the .centurion catalog authoritative when a project
+// is opened. A missing config is created from the current local catalog once,
+// which migrates installations created before project-owned config existed.
+func (s *Store) LoadProjectConfig(ctx context.Context, projectID string) error {
+	project, err := s.GetProject(ctx, strings.TrimSpace(projectID))
+	if err != nil {
+		return err
+	}
+	return s.syncProjectConfig(ctx, project)
+}
+
+func (s *Store) syncProjectConfig(ctx context.Context, project model.Project) error {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	path, err := projectmanifest.ConfigPath(project.Folders)
+	if err != nil {
+		return err
+	}
+	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+		return s.writeProjectConfigLocked(ctx, project)
+	} else if statErr != nil {
+		return fmt.Errorf("inspect project config: %w", statErr)
+	}
+	config, err := projectmanifest.ReadConfig(path)
+	if err != nil {
+		return err
+	}
+	if config.ProjectID != project.ID {
+		return fmt.Errorf("project config belongs to %q, expected %q", config.ProjectID, project.ID)
+	}
+	return s.importProjectConfigLocked(ctx, project, config)
+}
+
+func (s *Store) persistProjectConfig(ctx context.Context, projectID string) error {
+	if strings.TrimSpace(projectID) == "" {
+		return nil
+	}
+	project, err := s.GetProject(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("load project for config persistence: %w", err)
+	}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	return s.writeProjectConfigLocked(ctx, project)
+}
+
+func (s *Store) writeProjectConfigLocked(ctx context.Context, project model.Project) error {
+	agents, err := s.ListAgentsForProject(ctx, project.ID)
+	if err != nil {
+		return fmt.Errorf("list project agents: %w", err)
+	}
+	workflows, err := s.ListWorkflowsForProject(ctx, project.ID)
+	if err != nil {
+		return fmt.Errorf("list project workflows: %w", err)
+	}
+	schedules, err := s.ListSchedulesForProject(ctx, project.ID)
+	if err != nil {
+		return fmt.Errorf("list project schedules: %w", err)
+	}
+	_, err = projectmanifest.WriteConfig(model.ProjectConfig{
+		SchemaVersion: 1,
+		ProjectID:     project.ID,
+		Folders:       append([]string(nil), project.Folders...),
+		UpdatedAt:     now(),
+		Agents:        agents,
+		Workflows:     workflows,
+		Schedules:     schedules,
+	})
+	return err
+}
+
+func (s *Store) importProjectConfigLocked(ctx context.Context, project model.Project, config model.ProjectConfig) error {
+	if len(config.Folders) > 0 {
+		roots, err := security.NormalizeRoots(config.Folders)
+		if err != nil {
+			return fmt.Errorf("validate project config folders: %w", err)
+		}
+		if len(roots) != len(project.Folders) {
+			return errors.New("project config folder list does not match the project manifest")
+		}
+		for index := range roots {
+			if !strings.EqualFold(roots[index], project.Folders[index]) {
+				return errors.New("project config folder list does not match the project manifest")
+			}
+		}
+	}
+	for index := range config.Agents {
+		agent := &config.Agents[index]
+		if strings.TrimSpace(agent.ID) == "" || strings.TrimSpace(agent.Name) == "" || strings.TrimSpace(agent.Role) == "" {
+			return fmt.Errorf("project config agent %q is incomplete", agent.ID)
+		}
+		agent.ProjectID = project.ID
+		for rootIndex, root := range agent.WorkspaceRoots {
+			normalized, err := security.NormalizePath(root)
+			if err != nil {
+				return fmt.Errorf("validate workspace root for agent %s: %w", agent.ID, err)
+			}
+			if !security.IsWithinRoots(normalized, project.Folders) {
+				return fmt.Errorf("agent %s workspace root is outside the project", agent.ID)
+			}
+			agent.WorkspaceRoots[rootIndex] = normalized
+		}
+	}
+	workflowIDs := make(map[string]struct{}, len(config.Workflows))
+	for index := range config.Workflows {
+		workflow := &config.Workflows[index]
+		if strings.TrimSpace(workflow.ID) == "" || strings.TrimSpace(workflow.Name) == "" {
+			return errors.New("project config contains an incomplete workflow")
+		}
+		workflow.ProjectID = project.ID
+		workflowIDs[workflow.ID] = struct{}{}
+	}
+	for index := range config.Schedules {
+		if _, ok := workflowIDs[config.Schedules[index].WorkflowID]; !ok {
+			return fmt.Errorf("schedule %s references a workflow outside the project config", config.Schedules[index].ID)
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin project config import: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM schedules WHERE workflow_id IN (SELECT id FROM workflows WHERE project_id = ?)", project.ID); err != nil {
+		return fmt.Errorf("clear project schedules: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM workflows WHERE project_id = ?", project.ID); err != nil {
+		return fmt.Errorf("clear project workflows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM agents WHERE project_id = ?", project.ID); err != nil {
+		return fmt.Errorf("clear project agents: %w", err)
+	}
+	for _, agent := range config.Agents {
+		if err := insertAgent(ctx, tx, agent); err != nil {
+			return err
+		}
+	}
+	for _, workflow := range config.Workflows {
+		if err := insertWorkflow(ctx, tx, workflow); err != nil {
+			return err
+		}
+	}
+	for _, schedule := range config.Schedules {
+		if err := insertSchedule(ctx, tx, schedule); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit project config import: %w", err)
+	}
+	return nil
+}
+
+type sqlExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertAgent(ctx context.Context, execer sqlExecer, agent model.AgentProfile) error {
+	roots, err := jsonString(agent.WorkspaceRoots)
+	if err != nil {
+		return err
+	}
+	tools, err := jsonString(agent.ToolAllowlist)
+	if err != nil {
+		return err
+	}
+	if agent.CreatedAt == "" {
+		agent.CreatedAt = now()
+	}
+	if agent.UpdatedAt == "" {
+		agent.UpdatedAt = agent.CreatedAt
+	}
+	_, err = execer.ExecContext(ctx, `
+		INSERT INTO agents (id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
+		agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, agent.CreatedAt, agent.UpdatedAt)
+	return err
+}
+
+func insertWorkflow(ctx context.Context, execer sqlExecer, workflow model.WorkflowDefinition) error {
+	if workflow.Version <= 0 {
+		workflow.Version = 1
+	}
+	if workflow.CreatedAt == "" {
+		workflow.CreatedAt = now()
+	}
+	if workflow.UpdatedAt == "" {
+		workflow.UpdatedAt = workflow.CreatedAt
+	}
+	definition, err := json.Marshal(workflow)
+	if err != nil {
+		return fmt.Errorf("encode project workflow: %w", err)
+	}
+	_, err = execer.ExecContext(ctx, `
+		INSERT INTO workflows (id, project_id, name, version, definition_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, version=excluded.version, definition_json=excluded.definition_json, updated_at=excluded.updated_at`,
+		workflow.ID, workflow.ProjectID, workflow.Name, workflow.Version, string(definition), workflow.CreatedAt, workflow.UpdatedAt)
+	return err
+}
+
+func insertSchedule(ctx context.Context, execer sqlExecer, schedule model.Schedule) error {
+	if schedule.CreatedAt == "" {
+		schedule.CreatedAt = now()
+	}
+	if schedule.UpdatedAt == "" {
+		schedule.UpdatedAt = schedule.CreatedAt
+	}
+	_, err := execer.ExecContext(ctx, `
+		INSERT INTO schedules (id, name, workflow_id, cron, timezone, enabled, next_run_at, last_run_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET name=excluded.name, workflow_id=excluded.workflow_id, cron=excluded.cron, timezone=excluded.timezone, enabled=excluded.enabled, next_run_at=excluded.next_run_at, last_run_at=excluded.last_run_at, updated_at=excluded.updated_at`,
+		schedule.ID, schedule.Name, schedule.WorkflowID, schedule.Cron, schedule.Timezone, boolInt(schedule.Enabled), schedule.NextRunAt, schedule.LastRunAt, schedule.CreatedAt, schedule.UpdatedAt)
+	return err
 }
 
 func (s *Store) migrateLegacyLanguage(ctx context.Context) error {
@@ -460,10 +768,17 @@ func (s *Store) SaveAgent(ctx context.Context, agent model.AgentProfile) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
 		agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, agent.CreatedAt, agent.UpdatedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.persistProjectConfig(ctx, agent.ProjectID)
 }
 
 func (s *Store) DeleteAgent(ctx context.Context, id string) error {
+	var projectID string
+	if err := s.db.QueryRowContext(ctx, "SELECT project_id FROM agents WHERE id = ?", id).Scan(&projectID); err != nil {
+		return err
+	}
 	result, err := s.db.ExecContext(ctx, "DELETE FROM agents WHERE id = ?", id)
 	if err != nil {
 		return err
@@ -475,7 +790,7 @@ func (s *Store) DeleteAgent(ctx context.Context, id string) error {
 	if rows == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	return s.persistProjectConfig(ctx, projectID)
 }
 
 func (s *Store) ListAgents(ctx context.Context) ([]model.AgentProfile, error) {
@@ -537,7 +852,10 @@ func (s *Store) SaveWorkflow(ctx context.Context, workflow model.WorkflowDefinit
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, version=excluded.version, definition_json=excluded.definition_json, updated_at=excluded.updated_at`,
 		workflow.ID, workflow.ProjectID, workflow.Name, workflow.Version, string(definition), workflow.CreatedAt, workflow.UpdatedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.persistProjectConfig(ctx, workflow.ProjectID)
 }
 
 // ApplyBuilderProposal persists the newly generated profiles and workflow as
@@ -596,13 +914,24 @@ func (s *Store) ApplyBuilderProposal(ctx context.Context, agents []model.AgentPr
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit builder proposal: %w", err)
 	}
-	return nil
+	projectID := ""
+	if workflow != nil {
+		projectID = workflow.ProjectID
+	}
+	if projectID == "" && len(agents) > 0 {
+		projectID = agents[0].ProjectID
+	}
+	return s.persistProjectConfig(ctx, projectID)
 }
 
 func (s *Store) DeleteWorkflow(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return errors.New("workflow id is required")
+	}
+	var projectID string
+	if err := s.db.QueryRowContext(ctx, "SELECT project_id FROM workflows WHERE id = ?", id).Scan(&projectID); err != nil {
+		return err
 	}
 	var scheduleCount int
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schedules WHERE workflow_id = ?", id).Scan(&scheduleCount); err != nil {
@@ -622,7 +951,7 @@ func (s *Store) DeleteWorkflow(ctx context.Context, id string) error {
 	if rows == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	return s.persistProjectConfig(ctx, projectID)
 }
 
 func (s *Store) GetWorkflow(ctx context.Context, id string) (model.WorkflowDefinition, error) {
@@ -772,13 +1101,17 @@ func (s *Store) GetActiveProject(ctx context.Context) (model.Project, error) {
 }
 
 func (s *Store) SetActiveProject(ctx context.Context, id string) error {
-	if _, err := s.GetProject(ctx, id); err != nil {
+	project, err := s.GetProject(ctx, id)
+	if err != nil {
 		return err
+	}
+	if err := s.LoadProjectConfig(ctx, project.ID); err != nil {
+		return fmt.Errorf("load project config: %w", err)
 	}
 	if err := s.setSettingString(ctx, activeProjectSettingKey, id); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, "UPDATE projects SET last_opened_at = ?, updated_at = updated_at WHERE id = ?", now(), id)
+	_, err = s.db.ExecContext(ctx, "UPDATE projects SET last_opened_at = ?, updated_at = updated_at WHERE id = ?", now(), id)
 	return err
 }
 
@@ -1060,7 +1393,14 @@ func (s *Store) SaveSchedule(ctx context.Context, schedule model.Schedule) error
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, workflow_id=excluded.workflow_id, cron=excluded.cron, timezone=excluded.timezone, enabled=excluded.enabled, next_run_at=excluded.next_run_at, last_run_at=excluded.last_run_at, updated_at=excluded.updated_at`,
 		schedule.ID, schedule.Name, schedule.WorkflowID, schedule.Cron, schedule.Timezone, boolInt(schedule.Enabled), schedule.NextRunAt, schedule.LastRunAt, schedule.CreatedAt, schedule.UpdatedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	workflow, workflowErr := s.GetWorkflow(ctx, schedule.WorkflowID)
+	if workflowErr == nil {
+		return s.persistProjectConfig(ctx, workflow.ProjectID)
+	}
+	return nil
 }
 
 func (s *Store) ListSchedules(ctx context.Context) ([]model.Schedule, error) {
@@ -1098,8 +1438,20 @@ func (s *Store) listSchedules(ctx context.Context, projectID string) ([]model.Sc
 }
 
 func (s *Store) DeleteSchedule(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM schedules WHERE id = ?", id)
-	return err
+	var workflowID string
+	lookupErr := s.db.QueryRowContext(ctx, "SELECT workflow_id FROM schedules WHERE id = ?", id).Scan(&workflowID)
+	if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+		return lookupErr
+	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM schedules WHERE id = ?", id); err != nil {
+		return err
+	}
+	if lookupErr == nil {
+		if workflow, err := s.GetWorkflow(ctx, workflowID); err == nil {
+			return s.persistProjectConfig(ctx, workflow.ProjectID)
+		}
+	}
+	return nil
 }
 
 func (s *Store) ListSystemPrompts(ctx context.Context) ([]model.SystemPrompt, error) {

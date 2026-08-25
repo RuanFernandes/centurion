@@ -49,6 +49,13 @@ func main() {
 				respondError(request.ID, -32600, fmt.Sprintf("invalid approval policy %q", approvalPolicy))
 				continue
 			}
+			sandbox, _ := params["sandbox"].(string)
+			switch sandbox {
+			case "read-only", "workspace-write", "danger-full-access":
+			default:
+				respondError(request.ID, -32600, fmt.Sprintf("invalid sandbox %q", sandbox))
+				continue
+			}
 			respond(request.ID, map[string]any{"thread": map[string]any{"id": "fake-thread-1"}})
 		case "thread/resume", "turn/interrupt":
 			respond(request.ID, map[string]any{})

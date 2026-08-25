@@ -499,9 +499,9 @@ func (a *AppServer) runAgentTurn(ctx context.Context, agent model.AgentProfile, 
 		}
 		if len(agent.WorkspaceRoots) > 0 {
 			params["cwd"] = agent.WorkspaceRoots[0]
-			params["sandbox"] = "workspaceWrite"
+			params["sandbox"] = "workspace-write"
 		} else {
-			params["sandbox"] = "readOnly"
+			params["sandbox"] = "read-only"
 		}
 		var result struct {
 			Thread struct {

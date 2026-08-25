@@ -16,6 +16,7 @@ import (
 const (
 	DirectoryName = ".centurion"
 	ManifestName  = "project.json"
+	ConfigName    = "config.json"
 	ExportName    = "exports"
 )
 
@@ -34,6 +35,14 @@ func ManifestPath(folders []string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(root, DirectoryName, ManifestName), nil
+}
+
+func ConfigPath(folders []string) (string, error) {
+	root, err := primaryRoot(folders)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, DirectoryName, ConfigName), nil
 }
 
 func WriteManifest(value model.Project) (string, error) {
@@ -82,6 +91,52 @@ func ReadManifest(path string) (Manifest, error) {
 		return Manifest{}, errors.New("project manifest is invalid or unsupported")
 	}
 	return manifest, nil
+}
+
+func WriteConfig(value model.ProjectConfig) (string, error) {
+	if strings.TrimSpace(value.ProjectID) == "" {
+		return "", errors.New("project config requires a project id")
+	}
+	path, err := ConfigPath(value.Folders)
+	if err != nil {
+		return "", err
+	}
+	if value.SchemaVersion == 0 {
+		value.SchemaVersion = 1
+	}
+	if value.UpdatedAt == "" {
+		value.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	encoded, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("encode project config: %w", err)
+	}
+	if err := atomicWrite(path, append(encoded, '\n')); err != nil {
+		return "", fmt.Errorf("write project config: %w", err)
+	}
+	if err := ensureGitignore(filepath.Dir(path)); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func ReadConfig(path string) (model.ProjectConfig, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return model.ProjectConfig{}, errors.New("project config path is required")
+	}
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		return model.ProjectConfig{}, err
+	}
+	var config model.ProjectConfig
+	if err := json.Unmarshal(encoded, &config); err != nil {
+		return model.ProjectConfig{}, fmt.Errorf("decode project config: %w", err)
+	}
+	if config.SchemaVersion != 1 || strings.TrimSpace(config.ProjectID) == "" {
+		return model.ProjectConfig{}, errors.New("project config is invalid or unsupported")
+	}
+	return config, nil
 }
 
 func WriteSnapshot(value model.ProjectSnapshot) (string, error) {

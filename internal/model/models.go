@@ -221,6 +221,19 @@ type ProjectSnapshot struct {
 	History       []HistoryEntry       `json:"history"`
 }
 
+// ProjectConfig is the portable, project-owned catalog stored under the
+// primary workspace folder's .centurion directory. Runs, history, and audit
+// records remain in the local SQLite database because they are runtime data.
+type ProjectConfig struct {
+	SchemaVersion int                  `json:"schemaVersion"`
+	ProjectID     string               `json:"projectID"`
+	Folders       []string             `json:"folders"`
+	UpdatedAt     string               `json:"updatedAt"`
+	Agents        []AgentProfile       `json:"agents"`
+	Workflows     []WorkflowDefinition `json:"workflows"`
+	Schedules     []Schedule           `json:"schedules"`
+}
+
 type WorkflowLimits struct {
 	MaxDurationSeconds int `json:"maxDurationSeconds"`
 	MaxParallel        int `json:"maxParallel"`

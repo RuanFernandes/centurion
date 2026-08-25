@@ -52,3 +52,28 @@ func TestWriteSnapshotUsesPrivateExportDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestProjectConfigRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	value := model.ProjectConfig{
+		ProjectID: "project-config-test",
+		Folders:   []string{root},
+		Agents:    []model.AgentProfile{{ID: "agent-test", Name: "Builder", Role: "Implementer"}},
+		Workflows: []model.WorkflowDefinition{{ID: "workflow-test", Name: "Build", Version: 1}},
+	}
+
+	path, err := WriteConfig(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(path) != ConfigName || filepath.Base(filepath.Dir(path)) != DirectoryName {
+		t.Fatalf("config was written outside .centurion: %s", path)
+	}
+	loaded, err := ReadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SchemaVersion != 1 || loaded.ProjectID != value.ProjectID || len(loaded.Agents) != 1 || len(loaded.Workflows) != 1 {
+		t.Fatalf("project config round-trip failed: %#v", loaded)
+	}
+}

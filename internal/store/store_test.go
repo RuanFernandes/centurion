@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/RuanFernandes/centurion/internal/model"
+	projectmanifest "github.com/RuanFernandes/centurion/internal/project"
 )
 
 func TestStorePersistsAgentsRunsAndOrderedEvents(t *testing.T) {
@@ -182,6 +184,12 @@ func TestStorePersistsMultiFolderProjectsAndHistory(t *testing.T) {
 	ctx := context.Background()
 	firstFolder := filepath.Join(t.TempDir(), "service-a")
 	secondFolder := filepath.Join(t.TempDir(), "service-b")
+	if err := os.MkdirAll(firstFolder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(secondFolder, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	project := model.Project{ID: "project-multi", Name: "Multi service", Folders: []string{firstFolder, secondFolder}, Description: "Two repositories"}
 	if err := dataStore.SaveProject(ctx, project); err != nil {
 		t.Fatal(err)
@@ -247,6 +255,75 @@ func TestStoreScopesProjectCatalogs(t *testing.T) {
 	workflows, err := dataStore.ListWorkflowsForProject(ctx, "project-b")
 	if err != nil || len(workflows) != 1 || workflows[0].ID != "workflow-project-b" {
 		t.Fatalf("project B workflow catalog leaked: %#v, %v", workflows, err)
+	}
+}
+
+func TestProjectConfigRemainsAuthoritativeAfterCatalogDeletion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "centurion.db")
+	dataStore, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	project := model.Project{ID: "project-owned-config", Name: "Owned config", Folders: []string{root}}
+	if err := dataStore.SaveProject(ctx, project); err != nil {
+		dataStore.Close()
+		t.Fatal(err)
+	}
+	if err := dataStore.SetActiveProject(ctx, project.ID); err != nil {
+		dataStore.Close()
+		t.Fatal(err)
+	}
+	if err := dataStore.SaveAgent(ctx, model.AgentProfile{ID: "agent-owned", ProjectID: project.ID, Name: "Owned", Role: "Builder"}); err != nil {
+		dataStore.Close()
+		t.Fatal(err)
+	}
+	if err := dataStore.SaveWorkflow(ctx, model.WorkflowDefinition{ID: "workflow-owned", ProjectID: project.ID, Name: "Owned workflow", Version: 1}); err != nil {
+		dataStore.Close()
+		t.Fatal(err)
+	}
+	configPath, err := projectmanifest.ConfigPath(project.Folders)
+	if err != nil {
+		dataStore.Close()
+		t.Fatal(err)
+	}
+	config, err := projectmanifest.ReadConfig(configPath)
+	if err != nil || len(config.Agents) != 1 || len(config.Workflows) != 1 {
+		dataStore.Close()
+		t.Fatalf("project catalog was not written to .centurion: %#v, %v", config, err)
+	}
+	if err := dataStore.DeleteAgent(ctx, "agent-owned"); err != nil {
+		dataStore.Close()
+		t.Fatal(err)
+	}
+	if err := dataStore.DeleteWorkflow(ctx, "workflow-owned"); err != nil {
+		dataStore.Close()
+		t.Fatal(err)
+	}
+	if err := dataStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dataStore, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	agents, err := dataStore.ListAgentsForProject(ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflows, err := dataStore.ListWorkflowsForProject(ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 || len(workflows) != 0 {
+		t.Fatalf("deleted project catalog was recreated on startup: agents=%d workflows=%d", len(agents), len(workflows))
+	}
+	config, err = projectmanifest.ReadConfig(configPath)
+	if err != nil || len(config.Agents) != 0 || len(config.Workflows) != 0 {
+		t.Fatalf("deleted catalog was not persisted: %#v, %v", config, err)
 	}
 }
 

@@ -119,9 +119,9 @@ Centurion reuses the Codex session from the local machine. If the runtime report
 
 ## Project storage
 
-Centurion is project-first. A project can contain multiple workspace folders, including folders from different repositories. When a project is created or opened, Centurion writes a small `.centurion/project.json` manifest in the first selected folder. Runtime state remains in the per-user SQLite database under `%LOCALAPPDATA%/Centurion`; it is not written into the repository by default.
+Centurion is project-first. A project can contain multiple workspace folders, including folders from different repositories. When a project is created or opened, Centurion writes a small `.centurion/project.json` manifest and a project-owned `.centurion/config.json` in the first selected folder. The config is the source of truth for that project's agents, workflows, and schedules; deletions and edits survive restarts and opening the project on another machine.
 
-The manifest is safe to commit when a team wants a portable project definition. Local databases, logs, exports, and transient state are ignored by the generated `.centurion/.gitignore`. Use **Export snapshot** in the Projects view to create a redacted, portable JSON snapshot under `.centurion/exports`.
+Runtime state—runs, threads, approvals, history, audit entries, and transient Codex data—remains in the per-user SQLite database under `%LOCALAPPDATA%/Centurion`. Databases, logs, exports, and transient state are ignored by the generated `.centurion/.gitignore`; `config.json` is intentionally available for review or versioning, but it must not contain credentials or secrets. Use **Export snapshot** in the Projects view to create a redacted, portable JSON snapshot under `.centurion/exports`.
 
 ## Runtime and usage controls
 
