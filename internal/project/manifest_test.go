@@ -42,8 +42,11 @@ func TestWriteSnapshotUsesPrivateExportDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Dir(filepath.Dir(path)) != filepath.Join(root, DirectoryName) {
-		t.Fatalf("snapshot escaped project metadata directory: %s", path)
+	expectedDirectory := filepath.Join(root, DirectoryName, ExportName)
+	expectedInfo, expectedErr := os.Stat(expectedDirectory)
+	actualInfo, actualErr := os.Stat(filepath.Dir(path))
+	if expectedErr != nil || actualErr != nil || !os.SameFile(expectedInfo, actualInfo) {
+		t.Fatalf("snapshot escaped project export directory: %s", path)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatal(err)
