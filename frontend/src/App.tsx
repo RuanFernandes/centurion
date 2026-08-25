@@ -75,6 +75,32 @@ function errorText(error: unknown): string {
   return 'Could not complete the operation.'
 }
 
+async function copyToClipboard(value: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value)
+      return true
+    }
+  } catch {
+    // Fall through to the legacy clipboard path for desktop webviews.
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = value
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  try {
+    textarea.select()
+    return document.execCommand('copy')
+  } catch {
+    return false
+  } finally {
+    textarea.remove()
+  }
+}
+
 function formatTime(value?: string): string {
   if (!value) return '—'
   const date = new Date(value)
@@ -987,12 +1013,14 @@ function HistoryView({ entries, kind, onKindChange }: { entries: HistoryEntry[];
   </div>
 }
 
-type BuilderMessage = { id: number; role: 'user' | 'assistant' | 'system'; text: string }
 type BuilderMode = 'planning' | 'building'
+type BuilderRequestMeta = { prompt: string; mode: BuilderMode; modelID?: string; reasoningEffort?: string; durationMs?: number }
+type BuilderMessage = { id: number; role: 'user' | 'assistant' | 'system'; text: string; request?: BuilderRequestMeta }
 
 type CodexBlock =
   | { kind: 'paragraph'; lines: string[] }
   | { kind: 'heading'; level: 1 | 2 | 3; text: string }
+  | { kind: 'quote'; lines: string[] }
   | { kind: 'list'; ordered: boolean; start?: number; items: string[] }
   | { kind: 'code'; language: string; code: string }
 
@@ -1004,6 +1032,7 @@ const orderedListItem = /^\s*(\d+)[.)]\s+(.+)$/
 function isCodexBlockStart(line: string): boolean {
   return fencedCodeStart.test(line)
     || /^(#{1,3})\s+/.test(line)
+    || /^\s*>\s?/.test(line)
     || unorderedListItem.test(line)
     || orderedListItem.test(line)
 }
@@ -1030,6 +1059,20 @@ function parseCodexBlocks(source: string): CodexBlock[] {
       }
       if (index < lines.length) index += 1
       blocks.push({ kind: 'code', language: fence[1] || 'text', code: code.join('\n') })
+      continue
+    }
+
+    const quote = line.match(/^\s*>\s?(.*)$/)
+    if (quote) {
+      const quoteLines = [quote[1]]
+      index += 1
+      while (index < lines.length) {
+        const nextQuote = lines[index].match(/^\s*>\s?(.*)$/)
+        if (!nextQuote) break
+        quoteLines.push(nextQuote[1])
+        index += 1
+      }
+      blocks.push({ kind: 'quote', lines: quoteLines })
       continue
     }
 
@@ -1078,7 +1121,7 @@ function parseCodexBlocks(source: string): CodexBlock[] {
 
 function renderCodexInline(value: string, keyPrefix: string): ReactNode[] {
   const nodes: ReactNode[] = []
-  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_)/g
+  const pattern = /(\[[^\]\n]+\]\(https?:\/\/[^\s)]+\)|`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_)/g
   let cursor = 0
   let match: RegExpExecArray | null
   let tokenIndex = 0
@@ -1087,7 +1130,10 @@ function renderCodexInline(value: string, keyPrefix: string): ReactNode[] {
     if (match.index > cursor) nodes.push(value.slice(cursor, match.index))
     const token = match[0]
     const key = `${keyPrefix}-${tokenIndex}`
-    if (token.startsWith('`')) {
+    const link = token.match(/^\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)$/)
+    if (link) {
+      nodes.push(<a className="codex-inline-link" href={link[2]} target="_blank" rel="noreferrer" key={key}>{renderCodexInline(link[1], `${key}-link`)}</a>)
+    } else if (token.startsWith('`')) {
       nodes.push(<code className="codex-inline-code" key={key}>{token.slice(1, -1)}</code>)
     } else if (token.startsWith('**') || token.startsWith('__')) {
       nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>)
@@ -1109,14 +1155,15 @@ function renderCodexLines(lines: string[], keyPrefix: string): ReactNode[] {
   ])
 }
 
-function CodexResponse({ text }: { text: string }) {
+function CodexResponse({ text, messageID, copiedCodeID, onCopyCode }: { text: string; messageID: number; copiedCodeID: string; onCopyCode: (code: string, codeID: string) => void }) {
   const blocks = parseCodexBlocks(text)
   return <div className="codex-richtext">
     {blocks.map((block, index) => {
       const key = `codex-block-${index}`
       if (block.kind === 'code') {
+        const codeID = `${messageID}-${key}`
         return <div className="codex-code-block" key={key}>
-          <div className="codex-code-toolbar"><span>{block.language}</span><span>Code</span></div>
+          <div className="codex-code-toolbar"><span>{block.language}</span><button type="button" className="codex-copy-button" onClick={() => onCopyCode(block.code, codeID)} aria-label={`Copy ${block.language} code`}>{copiedCodeID === codeID ? 'Copied' : 'Copy'}</button></div>
           <pre><code>{block.code}</code></pre>
         </div>
       }
@@ -1129,6 +1176,9 @@ function CodexResponse({ text }: { text: string }) {
         return block.ordered
           ? <ol className="codex-response-list" start={block.start} key={key}>{items}</ol>
           : <ul className="codex-response-list" key={key}>{items}</ul>
+      }
+      if (block.kind === 'quote') {
+        return <blockquote className="codex-response-quote" key={key}>{renderCodexLines(block.lines, key)}</blockquote>
       }
       return <p className="codex-response-paragraph" key={key}>{renderCodexLines(block.lines, key)}</p>
     })}
@@ -1174,8 +1224,13 @@ function BuilderView({
   const [selectedEffort, setSelectedEffort] = useState('')
   const [busy, setBusy] = useState(false)
   const [confirming, setConfirming] = useState(false)
+  const [expandedMessages, setExpandedMessages] = useState<Set<number>>(new Set())
+  const [copiedID, setCopiedID] = useState('')
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false)
   const messageID = useRef(0)
   const plannerSelectionInitialized = useRef(false)
+  const messagesScrollRef = useRef<HTMLDivElement>(null)
+  const followTranscript = useRef(true)
 
   const selectedModel = models.find((model) => model.id === selectedModelID) ?? models.find((model) => model.isDefault) ?? models[0]
   const selectedPlanner = agents.find((agent) => agent.id === plannerAgentID)
@@ -1204,25 +1259,79 @@ function BuilderView({
     plannerSelectionInitialized.current = true
   }, [agents])
 
-  const appendMessage = (role: BuilderMessage['role'], text: string) => {
+  useEffect(() => {
+    const container = messagesScrollRef.current
+    if (!container || !followTranscript.current) return
+    const frame = window.requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight
+      setShowJumpToLatest(false)
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [messages.length, busy, expandedMessages])
+
+  const appendMessage = (role: BuilderMessage['role'], text: string, request?: BuilderRequestMeta) => {
     messageID.current += 1
-    setMessages((current) => [...current, { id: messageID.current, role, text }])
+    setMessages((current) => [...current, { id: messageID.current, role, text, request }])
   }
 
-  const send = async () => {
-    const value = prompt.trim()
+  const handleMessagesScroll = () => {
+    const container = messagesScrollRef.current
+    if (!container) return
+    const atBottom = container.scrollHeight - container.clientHeight - container.scrollTop <= 42
+    followTranscript.current = atBottom
+    setShowJumpToLatest(!atBottom)
+  }
+
+  const jumpToLatest = () => {
+    const container = messagesScrollRef.current
+    if (!container) return
+    followTranscript.current = true
+    setShowJumpToLatest(false)
+    container.scrollTo({ top: container.scrollHeight, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
+  }
+
+  const copyValue = async (value: string, copyID: string) => {
+    const copied = await copyToClipboard(value)
+    if (!copied) {
+      onNotice('Could not copy this response to the clipboard.')
+      return
+    }
+    setCopiedID(copyID)
+    window.setTimeout(() => setCopiedID((current) => current === copyID ? '' : current), 1600)
+  }
+
+  const toggleExpanded = (id: number) => {
+    setExpandedMessages((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const submit = async (rawValue: string, options: { recordUser?: boolean; requestMode?: BuilderMode } = {}) => {
+    const value = rawValue.trim()
+    const requestMode = options.requestMode ?? mode
     if (!value || busy) return
     if (auth.status !== 'logged_in') {
       onNotice('Codex is not authenticated. Sign in through the Codex CLI; Centurion does not manage account login.')
       return
     }
-    appendMessage('user', value)
+    if (options.recordUser !== false) appendMessage('user', value)
     setPrompt('')
     setProposal(null)
     setConfirming(false)
     setBusy(true)
+    const startedAt = performance.now()
     try {
-      if (mode === 'planning') {
+      const requestMeta = (durationMs: number): BuilderRequestMeta => ({
+        prompt: value,
+        mode: requestMode,
+        modelID: selectedModelID || selectedModel?.id,
+        reasoningEffort: selectedEffort || undefined,
+        durationMs,
+      })
+      if (requestMode === 'planning') {
         const response = await api.planWithCodex({
           prompt: value,
           projectID: project?.id,
@@ -1232,7 +1341,7 @@ function BuilderView({
           reasoningEffort: selectedEffort || undefined,
         })
         setPlanningThreadID(response.threadID)
-        appendMessage('assistant', response.reply || 'The planning lead did not return a message.')
+        appendMessage('assistant', response.reply || 'The planning lead did not return a message.', requestMeta(Math.round(performance.now() - startedAt)))
       } else {
         const response = await api.generateBuilderProposal({
           prompt: value,
@@ -1243,7 +1352,7 @@ function BuilderView({
         })
         setBuilderThreadID(response.threadID)
         setProposal(response.proposal)
-        appendMessage('assistant', response.reply || response.proposal.summary)
+        appendMessage('assistant', response.reply || response.proposal.summary, requestMeta(Math.round(performance.now() - startedAt)))
       }
     } catch (error) {
       appendMessage('system', errorText(error))
@@ -1253,6 +1362,22 @@ function BuilderView({
     }
   }
 
+  const send = async () => {
+    await submit(prompt)
+  }
+
+  const regenerateResponse = async (message: BuilderMessage) => {
+    if (!message.request) return
+    setMode(message.request.mode)
+    await submit(message.request.prompt, { recordUser: false, requestMode: message.request.mode })
+  }
+
+  const continueResponse = async (message: BuilderMessage) => {
+    if (!message.request) return
+    setMode(message.request.mode)
+    await submit('Continue the previous response from where it stopped. Do not repeat content already provided; finish the remaining useful details.', { requestMode: message.request.mode })
+  }
+
   const prepareBuild = async () => {
     if (!project || !hasAssistantReply || busy) return
     if (auth.status !== 'logged_in') {
@@ -1260,9 +1385,11 @@ function BuilderView({
       return
     }
     setBusy(true)
+    const handoffPrompt = planningBrief(messages, project)
+    const startedAt = performance.now()
     try {
       const response = await api.generateBuilderProposal({
-        prompt: planningBrief(messages, project),
+        prompt: handoffPrompt,
         projectID: project.id,
         modelID: selectedModelID || undefined,
         reasoningEffort: selectedEffort || undefined,
@@ -1271,7 +1398,7 @@ function BuilderView({
       setProposal(response.proposal)
       setConfirming(false)
       setMode('building')
-      appendMessage('assistant', 'The agreed plan is now a reviewable execution proposal. Check the agents, access levels, and workflow before applying it.')
+      appendMessage('assistant', 'The agreed plan is now a reviewable execution proposal. Check the agents, access levels, and workflow before applying it.', { prompt: handoffPrompt, mode: 'building', modelID: selectedModelID || selectedModel?.id, reasoningEffort: selectedEffort || undefined, durationMs: Math.round(performance.now() - startedAt) })
     } catch (error) {
       appendMessage('system', errorText(error))
       onNotice(errorText(error))
@@ -1315,10 +1442,19 @@ function BuilderView({
     setProposal(null)
     setConfirming(false)
     setPrompt('')
+    setExpandedMessages(new Set())
+    setCopiedID('')
+    followTranscript.current = true
+    setShowJumpToLatest(false)
   }
 
   const workflow = proposal?.workflow ?? null
   const draftAgentByID = new Map((proposal?.agents ?? []).map((agent) => [agent.temporaryID, agent]))
+  const lastAssistantMessageID = [...messages].reverse().find((message) => message.role === 'assistant')?.id
+  const responsePreview = (text: string) => {
+    const compact = text.replace(/```[\s\S]*?```/g, '[Code block]').replace(/\s+/g, ' ').trim()
+    return compact.length > 520 ? `${compact.slice(0, 520).trimEnd()}…` : compact
+  }
   return (
     <div className="view-stack builder-page">
       <div className="view-heading builder-heading">
@@ -1328,7 +1464,32 @@ function BuilderView({
       {!project ? <div className="empty-state panel-card"><strong>Choose a project first</strong><span>The planning room uses project folders as the safe workspace boundary.</span></div> : <div className="builder-layout">
         <section className="panel-card builder-chat" aria-label={mode === 'planning' ? 'Codex planning room' : 'Codex builder chat'}>
           <div className="builder-chat-header"><div><span className="eyebrow">{mode === 'planning' ? 'Planning room' : 'Execution handoff'}</span><h2>{mode === 'planning' ? 'Shape the plan together' : 'Review the execution proposal'}</h2></div><div className="builder-chat-header-actions"><span className="builder-chat-scope">{mode === 'planning' ? 'Read-only' : 'Draft only'}</span><button type="button" className="link-button" onClick={newConversation} disabled={busy}>New chat</button></div></div>
-          {messages.length === 0 ? <div className="builder-welcome"><div className="builder-welcome-mark">{mode === 'planning' ? '◎' : '✦'}</div><div><strong>{mode === 'planning' ? 'Start with the outcome and constraints.' : 'Turn the agreement into a build.'}</strong><p>{mode === 'planning' ? 'Explain what you want to accomplish. The planning lead will ask focused questions, surface risks, and add ideas before anything is delegated.' : 'The builder will translate the agreed plan into reviewable agent profiles and a bounded visual workflow.'}</p></div><div className="builder-example-list">{examples.map((example) => <button type="button" key={example} onClick={() => setPrompt(example)}>{example}<span>Use example →</span></button>)}</div></div> : <div className="builder-messages" aria-live="polite">{messages.map((message) => <article className={`builder-message builder-message-${message.role}`} key={message.id}><span className="builder-message-label">{message.role === 'user' ? 'You' : message.role === 'assistant' ? (mode === 'planning' ? 'Planning lead' : 'Codex') : 'Centurion'}</span><CodexResponse text={message.text} /></article>)}{busy && <div className="builder-thinking"><span className="builder-thinking-dot" />{mode === 'planning' ? 'The planning lead is thinking…' : 'Codex is drafting a proposal…'}</div>}</div>}
+          {messages.length === 0 ? <div className="builder-welcome"><div className="builder-welcome-mark">{mode === 'planning' ? '◎' : '✦'}</div><div><strong>{mode === 'planning' ? 'Start with the outcome and constraints.' : 'Turn the agreement into a build.'}</strong><p>{mode === 'planning' ? 'Explain what you want to accomplish. The planning lead will ask focused questions, surface risks, and add ideas before anything is delegated.' : 'The builder will translate the agreed plan into reviewable agent profiles and a bounded visual workflow.'}</p></div><div className="builder-example-list">{examples.map((example) => <button type="button" key={example} onClick={() => setPrompt(example)}>{example}<span>Use example →</span></button>)}</div></div> : <div className="builder-transcript">
+            <div className="builder-messages" ref={messagesScrollRef} onScroll={handleMessagesScroll} aria-live="polite">
+              {messages.map((message) => {
+                const isLongResponse = message.role === 'assistant' && (message.text.length > 2400 || message.text.split('\n').length > 36)
+                const isCollapsed = isLongResponse && !expandedMessages.has(message.id)
+                const model = message.request?.modelID ? models.find((item) => item.id === message.request?.modelID) : undefined
+                const label = message.role === 'user' ? 'You' : message.role === 'assistant' ? (message.request?.mode === 'planning' ? 'Planning lead' : 'Codex') : 'Centurion'
+                return <article className={`builder-message builder-message-${message.role}`} key={message.id}>
+                  <div className="builder-message-topline">
+                    <span className="builder-message-label">{label}</span>
+                    <div className="builder-message-tools">
+                      {message.request && <span className="builder-message-meta">{model?.displayName ?? 'Codex'} · {message.request.reasoningEffort ?? 'auto'}{message.request.durationMs ? ` · ${message.request.durationMs}ms` : ''}</span>}
+                      <button type="button" className="builder-message-copy" onClick={() => void copyValue(message.text, `message-${message.id}`)} aria-label={`Copy ${label.toLowerCase()} response`}>{copiedID === `message-${message.id}` ? 'Copied' : 'Copy'}</button>
+                    </div>
+                  </div>
+                  <div className={`builder-message-body ${isCollapsed ? 'collapsed' : ''}`}>
+                    {isCollapsed ? <p className="codex-response-preview">{responsePreview(message.text)}</p> : <CodexResponse text={message.text} messageID={message.id} copiedCodeID={copiedID} onCopyCode={(code, codeID) => void copyValue(code, codeID)} />}
+                    {isLongResponse && <button type="button" className="builder-expand-button" onClick={() => toggleExpanded(message.id)}>{isCollapsed ? 'Show full response' : 'Collapse response'}</button>}
+                  </div>
+                  {message.role === 'assistant' && message.request && message.id === lastAssistantMessageID && <div className="builder-reply-actions"><button type="button" className="builder-reply-action" onClick={() => void regenerateResponse(message)} disabled={busy}>Regenerate</button><button type="button" className="builder-reply-action" onClick={() => void continueResponse(message)} disabled={busy}>Continue</button></div>}
+                </article>
+              })}
+              {busy && <div className="builder-thinking"><span className="builder-thinking-dot" />{mode === 'planning' ? 'The planning lead is thinking…' : 'Codex is drafting a proposal…'}</div>}
+            </div>
+            {showJumpToLatest && <button type="button" className="builder-jump-latest" onClick={jumpToLatest}><span aria-hidden="true">↓</span>New response</button>}
+          </div>}
           <div className="builder-composer"><div className="builder-composer-label"><span>{mode === 'planning' ? 'Planning brief' : 'Build request'}</span><span>Ctrl+Enter</span></div><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); void send() } }} placeholder={mode === 'planning' ? 'Explain the outcome, constraints, and open questions...' : 'Describe the agents and workflow to create...'} rows={3} aria-label={mode === 'planning' ? 'Explain the project scope to the planning lead' : 'Describe the agents and workflow to create'} /><div className="builder-composer-footer"><span>{mode === 'planning' ? 'Read-only conversation · no tools or file changes.' : 'No changes are made until you apply a proposal.'}</span><div className="builder-composer-actions">{mode === 'planning' && hasAssistantReply && <button type="button" className="button subtle" onClick={() => void prepareBuild()} disabled={busy}>Build from plan</button>}<button type="button" className="button primary" onClick={() => void send()} disabled={busy || !prompt.trim()}>{busy ? 'Working…' : mode === 'planning' ? 'Discuss' : 'Ask Codex'}</button></div></div></div>
         </section>
         <aside className="builder-side">
