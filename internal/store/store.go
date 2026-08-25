@@ -524,15 +524,19 @@ func (s *Store) writeProjectConfigLocked(ctx context.Context, project model.Proj
 
 func (s *Store) importProjectConfigLocked(ctx context.Context, project model.Project, config model.ProjectConfig) error {
 	if len(config.Folders) > 0 {
-		roots, err := security.NormalizeRoots(config.Folders)
+		configRoots, err := security.NormalizeRoots(config.Folders)
 		if err != nil {
 			return fmt.Errorf("validate project config folders: %w", err)
 		}
-		if len(roots) != len(project.Folders) {
+		projectRoots, err := security.NormalizeRoots(project.Folders)
+		if err != nil {
+			return fmt.Errorf("validate project manifest folders: %w", err)
+		}
+		if len(configRoots) != len(projectRoots) {
 			return errors.New("project config folder list does not match the project manifest")
 		}
-		for index := range roots {
-			if !strings.EqualFold(roots[index], project.Folders[index]) {
+		for index := range configRoots {
+			if !strings.EqualFold(configRoots[index], projectRoots[index]) {
 				return errors.New("project config folder list does not match the project manifest")
 			}
 		}
