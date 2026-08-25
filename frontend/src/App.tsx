@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Events, Window as WailsWindow } from '@wailsio/runtime'
 import { api } from './api'
 import type {
@@ -990,6 +990,151 @@ function HistoryView({ entries, kind, onKindChange }: { entries: HistoryEntry[];
 type BuilderMessage = { id: number; role: 'user' | 'assistant' | 'system'; text: string }
 type BuilderMode = 'planning' | 'building'
 
+type CodexBlock =
+  | { kind: 'paragraph'; lines: string[] }
+  | { kind: 'heading'; level: 1 | 2 | 3; text: string }
+  | { kind: 'list'; ordered: boolean; start?: number; items: string[] }
+  | { kind: 'code'; language: string; code: string }
+
+const fencedCodeStart = /^ {0,3}```\s*([\w.+-]*)\s*$/
+const fencedCodeEnd = /^ {0,3}```\s*$/
+const unorderedListItem = /^\s*[-*+]\s+(.+)$/
+const orderedListItem = /^\s*(\d+)[.)]\s+(.+)$/
+
+function isCodexBlockStart(line: string): boolean {
+  return fencedCodeStart.test(line)
+    || /^(#{1,3})\s+/.test(line)
+    || unorderedListItem.test(line)
+    || orderedListItem.test(line)
+}
+
+function parseCodexBlocks(source: string): CodexBlock[] {
+  const lines = source.replace(/\r\n?/g, '\n').split('\n')
+  const blocks: CodexBlock[] = []
+  let index = 0
+
+  while (index < lines.length) {
+    const line = lines[index]
+    if (!line.trim()) {
+      index += 1
+      continue
+    }
+
+    const fence = line.match(fencedCodeStart)
+    if (fence) {
+      index += 1
+      const code: string[] = []
+      while (index < lines.length && !fencedCodeEnd.test(lines[index])) {
+        code.push(lines[index])
+        index += 1
+      }
+      if (index < lines.length) index += 1
+      blocks.push({ kind: 'code', language: fence[1] || 'text', code: code.join('\n') })
+      continue
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/)
+    if (heading) {
+      blocks.push({ kind: 'heading', level: heading[1].length as 1 | 2 | 3, text: heading[2] })
+      index += 1
+      continue
+    }
+
+    const unordered = line.match(unorderedListItem)
+    const ordered = line.match(orderedListItem)
+    if (unordered || ordered) {
+      const isOrdered = Boolean(ordered)
+      const items: string[] = []
+      const start = ordered ? Number(ordered[1]) : undefined
+
+      while (index < lines.length) {
+        const current = lines[index]
+        const item = isOrdered ? current.match(orderedListItem) : current.match(unorderedListItem)
+        if (!item) break
+        items.push(isOrdered ? item[2] : item[1])
+        index += 1
+
+        while (index < lines.length && lines[index].trim() && !isCodexBlockStart(lines[index])) {
+          items[items.length - 1] += `\n${lines[index].trim()}`
+          index += 1
+        }
+      }
+
+      blocks.push({ kind: 'list', ordered: isOrdered, start, items })
+      continue
+    }
+
+    const paragraph = [line]
+    index += 1
+    while (index < lines.length && lines[index].trim() && !isCodexBlockStart(lines[index])) {
+      paragraph.push(lines[index])
+      index += 1
+    }
+    blocks.push({ kind: 'paragraph', lines: paragraph })
+  }
+
+  return blocks
+}
+
+function renderCodexInline(value: string, keyPrefix: string): ReactNode[] {
+  const nodes: ReactNode[] = []
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_)/g
+  let cursor = 0
+  let match: RegExpExecArray | null
+  let tokenIndex = 0
+
+  while ((match = pattern.exec(value)) !== null) {
+    if (match.index > cursor) nodes.push(value.slice(cursor, match.index))
+    const token = match[0]
+    const key = `${keyPrefix}-${tokenIndex}`
+    if (token.startsWith('`')) {
+      nodes.push(<code className="codex-inline-code" key={key}>{token.slice(1, -1)}</code>)
+    } else if (token.startsWith('**') || token.startsWith('__')) {
+      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>)
+    } else {
+      nodes.push(<em key={key}>{token.slice(1, -1)}</em>)
+    }
+    cursor = match.index + token.length
+    tokenIndex += 1
+  }
+
+  if (cursor < value.length) nodes.push(value.slice(cursor))
+  return nodes.length > 0 ? nodes : [value]
+}
+
+function renderCodexLines(lines: string[], keyPrefix: string): ReactNode[] {
+  return lines.flatMap((line, index) => [
+    ...renderCodexInline(line, `${keyPrefix}-${index}`),
+    ...(index < lines.length - 1 ? [<br key={`${keyPrefix}-break-${index}`} />] : []),
+  ])
+}
+
+function CodexResponse({ text }: { text: string }) {
+  const blocks = parseCodexBlocks(text)
+  return <div className="codex-richtext">
+    {blocks.map((block, index) => {
+      const key = `codex-block-${index}`
+      if (block.kind === 'code') {
+        return <div className="codex-code-block" key={key}>
+          <div className="codex-code-toolbar"><span>{block.language}</span><span>Code</span></div>
+          <pre><code>{block.code}</code></pre>
+        </div>
+      }
+      if (block.kind === 'heading') {
+        const Heading = `h${block.level}` as 'h1' | 'h2' | 'h3'
+        return <Heading className="codex-response-heading" key={key}>{renderCodexInline(block.text, key)}</Heading>
+      }
+      if (block.kind === 'list') {
+        const items = block.items.map((item, itemIndex) => <li key={`${key}-item-${itemIndex}`}>{renderCodexLines(item.split('\n'), `${key}-item-${itemIndex}`)}</li>)
+        return block.ordered
+          ? <ol className="codex-response-list" start={block.start} key={key}>{items}</ol>
+          : <ul className="codex-response-list" key={key}>{items}</ul>
+      }
+      return <p className="codex-response-paragraph" key={key}>{renderCodexLines(block.lines, key)}</p>
+    })}
+  </div>
+}
+
 function planningBrief(messages: BuilderMessage[], project: Project): string {
   const transcript = messages
     .slice(-16)
@@ -1183,7 +1328,7 @@ function BuilderView({
       {!project ? <div className="empty-state panel-card"><strong>Choose a project first</strong><span>The planning room uses project folders as the safe workspace boundary.</span></div> : <div className="builder-layout">
         <section className="panel-card builder-chat" aria-label={mode === 'planning' ? 'Codex planning room' : 'Codex builder chat'}>
           <div className="builder-chat-header"><div><span className="eyebrow">{mode === 'planning' ? 'Planning room' : 'Execution handoff'}</span><h2>{mode === 'planning' ? 'Shape the plan together' : 'Review the execution proposal'}</h2></div><div className="builder-chat-header-actions"><span className="builder-chat-scope">{mode === 'planning' ? 'Read-only' : 'Draft only'}</span><button type="button" className="link-button" onClick={newConversation} disabled={busy}>New chat</button></div></div>
-          {messages.length === 0 ? <div className="builder-welcome"><div className="builder-welcome-mark">{mode === 'planning' ? '◎' : '✦'}</div><div><strong>{mode === 'planning' ? 'Start with the outcome and constraints.' : 'Turn the agreement into a build.'}</strong><p>{mode === 'planning' ? 'Explain what you want to accomplish. The planning lead will ask focused questions, surface risks, and add ideas before anything is delegated.' : 'The builder will translate the agreed plan into reviewable agent profiles and a bounded visual workflow.'}</p></div><div className="builder-example-list">{examples.map((example) => <button type="button" key={example} onClick={() => setPrompt(example)}>{example}<span>Use example →</span></button>)}</div></div> : <div className="builder-messages" aria-live="polite">{messages.map((message) => <article className={`builder-message builder-message-${message.role}`} key={message.id}><span className="builder-message-label">{message.role === 'user' ? 'You' : message.role === 'assistant' ? (mode === 'planning' ? 'Planning lead' : 'Codex') : 'Centurion'}</span><p>{message.text}</p></article>)}{busy && <div className="builder-thinking"><span className="builder-thinking-dot" />{mode === 'planning' ? 'The planning lead is thinking…' : 'Codex is drafting a proposal…'}</div>}</div>}
+          {messages.length === 0 ? <div className="builder-welcome"><div className="builder-welcome-mark">{mode === 'planning' ? '◎' : '✦'}</div><div><strong>{mode === 'planning' ? 'Start with the outcome and constraints.' : 'Turn the agreement into a build.'}</strong><p>{mode === 'planning' ? 'Explain what you want to accomplish. The planning lead will ask focused questions, surface risks, and add ideas before anything is delegated.' : 'The builder will translate the agreed plan into reviewable agent profiles and a bounded visual workflow.'}</p></div><div className="builder-example-list">{examples.map((example) => <button type="button" key={example} onClick={() => setPrompt(example)}>{example}<span>Use example →</span></button>)}</div></div> : <div className="builder-messages" aria-live="polite">{messages.map((message) => <article className={`builder-message builder-message-${message.role}`} key={message.id}><span className="builder-message-label">{message.role === 'user' ? 'You' : message.role === 'assistant' ? (mode === 'planning' ? 'Planning lead' : 'Codex') : 'Centurion'}</span><CodexResponse text={message.text} /></article>)}{busy && <div className="builder-thinking"><span className="builder-thinking-dot" />{mode === 'planning' ? 'The planning lead is thinking…' : 'Codex is drafting a proposal…'}</div>}</div>}
           <div className="builder-composer"><div className="builder-composer-label"><span>{mode === 'planning' ? 'Planning brief' : 'Build request'}</span><span>Ctrl+Enter</span></div><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); void send() } }} placeholder={mode === 'planning' ? 'Explain the outcome, constraints, and open questions...' : 'Describe the agents and workflow to create...'} rows={3} aria-label={mode === 'planning' ? 'Explain the project scope to the planning lead' : 'Describe the agents and workflow to create'} /><div className="builder-composer-footer"><span>{mode === 'planning' ? 'Read-only conversation · no tools or file changes.' : 'No changes are made until you apply a proposal.'}</span><div className="builder-composer-actions">{mode === 'planning' && hasAssistantReply && <button type="button" className="button subtle" onClick={() => void prepareBuild()} disabled={busy}>Build from plan</button>}<button type="button" className="button primary" onClick={() => void send()} disabled={busy || !prompt.trim()}>{busy ? 'Working…' : mode === 'planning' ? 'Discuss' : 'Ask Codex'}</button></div></div></div>
         </section>
         <aside className="builder-side">
