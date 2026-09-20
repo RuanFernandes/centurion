@@ -1,30 +1,39 @@
-# Product brief
+# Product
 
-## Audience
+## Register
 
-Centurion is for developers who want a local virtual office for coordinating specialized agents across code, documentation, research, and automation workflows.
+product
 
-## Purpose
+## Users
 
-Centurion gives agent work an explicit operating model: reusable roles, bounded permissions, visual handoffs, structured outputs, approvals, checkpoints, and an observable run history. The 2D office gives the system personality, while persisted events and execution state remain the source of truth.
+Uso pessoal por uma pessoa desenvolvedora que quer montar um escritório virtual de agentes para executar workflows locais de código e automação geral.
 
-## Product principles
+## Product Purpose
 
-- Execution state is more important than decoration.
-- Every action should help create, validate, execute, inspect, or decide.
-- Risky actions must be visible, explainable, and easy to approve or decline.
-- A visual workflow should remain understandable as it grows.
-- Text, keyboard support, semantic color, and accessible state descriptions accompany animation.
-- Token and context usage should be reduced in code and data flow wherever possible, not only through prompt wording.
+Uma aplicação desktop Windows-first para criar agentes com papéis, conectar ferramentas, montar workflows visuais e acompanhar a execução em um escritório 2D. O produto usa o Codex App Server com login ChatGPT gerenciado, permitindo aproveitar a assinatura Pro sem exigir uma chave da API no MVP.
 
-## Brand personality
+Sucesso significa conseguir criar agentes, montar um workflow com supervisor, executar etapas paralelas e condicionais, acompanhar eventos em tempo real, pausar e retomar runs e controlar ações de risco sem perder clareza operacional.
 
-Playful, capable, and transparent. Centurion should feel like a reliable command center with the personality of a small operations studio—not a generic SaaS dashboard and not an opaque autonomous system.
+## Brand Personality
 
-## Visual boundaries
+Lúdica, competente e transparente. A interface deve parecer um centro de operações habitado por uma equipe pequena, sem esconder permissões, limites, falhas ou o que cada agente está fazendo.
 
-Avoid generic card-heavy SaaS layouts, decorative metrics without actions, excessive glassmorphism, purple gradients, vague AI copy, and animations that are the only way to understand execution.
+## Anti-references
 
-## Accessibility target
+- Dashboard genérico de cards sem relação clara com a execução.
+- Interface com gradientes roxos, excesso de glassmorphism ou neon decorativo.
+- Personagens animados sem ligação com eventos reais.
+- Autonomia silenciosa que executa shell, rede ou alterações destrutivas sem explicar o risco.
+- Configuração espalhada em prompts ocultos, sem workflow exportável ou histórico auditável.
 
-WCAG AA is the target. The product should support complete keyboard navigation, visible focus, comfortable hit targets, text equivalents for animated states, high-contrast semantics, and prefers-reduced-motion.
+## Design Principles
+
+- A execução é a fonte de verdade; o escritório visualiza o estado real.
+- Toda ação relevante tem contexto, permissão e resultado observável.
+- O caminho feliz deve ser divertido sem sacrificar controle técnico.
+- Workflows são artefatos versionáveis, validáveis e reproduzíveis.
+- Falhas, limites e pedidos de aprovação são estados de primeira classe.
+
+## Accessibility & Inclusion
+
+WCAG AA como objetivo para a interface operacional. Todos os estados visuais devem ter equivalente textual e acessível. A aplicação deve suportar navegação por teclado, foco visível, alto contraste e `prefers-reduced-motion`. Cores não podem ser o único indicador de estado.
