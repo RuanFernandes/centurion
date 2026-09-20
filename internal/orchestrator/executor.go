@@ -21,6 +21,31 @@ type ApprovalRequester func(context.Context, model.ApprovalRequest) (bool, error
 const defaultPromptTokenBudget = 12000
 
 var ErrPromptBudgetExceeded = errors.New("workflow prompt token budget exceeded")
+var ErrAgentBlocked = errors.New("agent reported a blocking result")
+
+type AgentBlockedError struct {
+	AgentName string
+	NodeID    string
+	Reason    string
+	Output    map[string]any
+}
+
+func (e *AgentBlockedError) Error() string {
+	if e == nil {
+		return ErrAgentBlocked.Error()
+	}
+	name := strings.TrimSpace(e.AgentName)
+	if name == "" {
+		name = "Agent"
+	}
+	reason := strings.TrimSpace(e.Reason)
+	if reason == "" {
+		reason = "the agent returned a blocking result"
+	}
+	return fmt.Sprintf("%s blocked workflow node %q: %s", name, e.NodeID, reason)
+}
+
+func (e *AgentBlockedError) Unwrap() error { return ErrAgentBlocked }
 
 type Executor struct {
 	store           *store.Store
@@ -29,9 +54,13 @@ type Executor struct {
 	emitEvent       func(model.RunEvent)
 	emitAgentState  func(model.AgentStateEvent)
 
-	mu       sync.Mutex
-	runtimes map[string]*runtime
-	usageMu  sync.Mutex
+	mu             sync.Mutex
+	runtimes       map[string]*runtime
+	usageMu        sync.Mutex
+	closeOnce      sync.Once
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	closed         bool
 }
 
 type runtime struct {
@@ -61,6 +90,7 @@ type branchResult struct {
 }
 
 func NewExecutor(dataStore *store.Store, appServer *codex.AppServer, requestApproval ApprovalRequester, emitEvent func(model.RunEvent), emitAgentState func(model.AgentStateEvent)) *Executor {
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	return &Executor{
 		store:           dataStore,
 		codex:           appServer,
@@ -68,10 +98,40 @@ func NewExecutor(dataStore *store.Store, appServer *codex.AppServer, requestAppr
 		emitEvent:       emitEvent,
 		emitAgentState:  emitAgentState,
 		runtimes:        make(map[string]*runtime),
+		shutdownCtx:     shutdownCtx,
+		shutdownCancel:  shutdownCancel,
 	}
 }
 
+// Close stops every active workflow runtime before the Codex process is
+// closed. The runtime context is also used by delay, approval, and other
+// non-Codex steps, so a shutdown cannot leave background work behind.
+func (e *Executor) Close() {
+	if e == nil {
+		return
+	}
+	e.closeOnce.Do(func() {
+		e.mu.Lock()
+		e.closed = true
+		runtimes := make([]*runtime, 0, len(e.runtimes))
+		for _, rt := range e.runtimes {
+			runtimes = append(runtimes, rt)
+		}
+		e.mu.Unlock()
+		e.shutdownCancel()
+		for _, rt := range runtimes {
+			rt.cancel()
+		}
+	})
+}
+
 func (e *Executor) Start(ctx context.Context, workflow model.WorkflowDefinition, input map[string]any, projects ...model.Project) (model.Run, error) {
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed {
+		return model.Run{}, errors.New("orchestrator is closed")
+	}
 	validation := ValidateWorkflow(workflow)
 	if !validation.Valid {
 		return model.Run{}, fmt.Errorf("workflow is invalid: %s", validation.Errors[0].Message)
@@ -85,11 +145,14 @@ func (e *Executor) Start(ctx context.Context, workflow model.WorkflowDefinition,
 	run := model.Run{
 		ID:         uuid.NewString(),
 		WorkflowID: workflow.ID,
-		Status:     model.RunStatusQueued,
-		Input:      cloneMap(input),
-		Output:     cloneMap(input),
-		StartedAt:  nowValue,
-		UpdatedAt:  nowValue,
+		// Interactive runs are admitted immediately. There is no in-process
+		// worker queue today, so exposing queued here only creates a stale
+		// snapshot between Start and the execution goroutine.
+		Status:    model.RunStatusRunning,
+		Input:     cloneMap(input),
+		Output:    cloneMap(input),
+		StartedAt: nowValue,
+		UpdatedAt: nowValue,
 	}
 	run.PromptTokenBudget = promptBudget(workflow)
 	if len(projects) > 0 {
@@ -108,14 +171,17 @@ func (e *Executor) Start(ctx context.Context, workflow model.WorkflowDefinition,
 }
 
 func (e *Executor) Pause(ctx context.Context, runID string) error {
+	run, err := e.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if isTerminalRunStatus(run.Status) {
+		return fmt.Errorf("run %s cannot be paused from status %s", runID, run.Status)
+	}
 	e.mu.Lock()
 	rt := e.runtimes[runID]
 	e.mu.Unlock()
 	if rt == nil {
-		run, err := e.store.GetRun(ctx, runID)
-		if err != nil {
-			return err
-		}
 		run.Paused = true
 		run.Status = model.RunStatusPaused
 		run.UpdatedAt = now()
@@ -124,10 +190,6 @@ func (e *Executor) Pause(ctx context.Context, runID string) error {
 	rt.mu.Lock()
 	rt.paused = true
 	rt.mu.Unlock()
-	run, err := e.store.GetRun(ctx, runID)
-	if err != nil {
-		return err
-	}
 	run.Paused = true
 	run.Status = model.RunStatusPaused
 	run.UpdatedAt = now()
@@ -139,6 +201,16 @@ func (e *Executor) Pause(ctx context.Context, runID string) error {
 }
 
 func (e *Executor) Resume(ctx context.Context, runID string) error {
+	run, err := e.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if isTerminalRunStatus(run.Status) {
+		return fmt.Errorf("run %s cannot be resumed from status %s", runID, run.Status)
+	}
+	if run.CancelRequested {
+		return fmt.Errorf("run %s has been canceled and cannot be resumed", runID)
+	}
 	e.mu.Lock()
 	rt := e.runtimes[runID]
 	e.mu.Unlock()
@@ -151,10 +223,6 @@ func (e *Executor) Resume(ctx context.Context, runID string) error {
 		}
 		rt.paused = false
 		rt.mu.Unlock()
-		run, err := e.store.GetRun(ctx, runID)
-		if err != nil {
-			return err
-		}
 		run.Paused = false
 		run.Status = model.RunStatusRunning
 		run.UpdatedAt = now()
@@ -164,19 +232,18 @@ func (e *Executor) Resume(ctx context.Context, runID string) error {
 		e.appendEvent(ctx, model.RunEvent{RunID: runID, Type: "run.resumed", Source: "orchestrator", Level: "info", Message: "Run resumed"})
 		return nil
 	}
-	run, err := e.store.GetRun(ctx, runID)
-	if err != nil {
-		return err
-	}
 	workflow, err := e.store.GetWorkflow(ctx, run.WorkflowID)
 	if err != nil {
 		return err
+	}
+	if validation := ValidateWorkflow(workflow); !validation.Valid {
+		return fmt.Errorf("workflow is invalid: %s", validation.Errors[0].Message)
 	}
 	if run.Status != model.RunStatusPaused && run.Status != model.RunStatusInterrupted {
 		return fmt.Errorf("run %s cannot be resumed from status %s", runID, run.Status)
 	}
 	run.Paused = false
-	run.Status = model.RunStatusQueued
+	run.Status = model.RunStatusRunning
 	run.UpdatedAt = now()
 	if err := e.store.UpdateRun(ctx, run); err != nil {
 		return err
@@ -190,13 +257,19 @@ func (e *Executor) Resume(ctx context.Context, runID string) error {
 }
 
 func (e *Executor) Cancel(ctx context.Context, runID string) error {
-	e.mu.Lock()
-	rt := e.runtimes[runID]
-	e.mu.Unlock()
 	run, err := e.store.GetRun(ctx, runID)
 	if err != nil {
 		return err
 	}
+	if isTerminalRunStatus(run.Status) {
+		if run.Status == model.RunStatusCanceled {
+			return nil
+		}
+		return fmt.Errorf("run %s cannot be canceled from status %s", runID, run.Status)
+	}
+	e.mu.Lock()
+	rt := e.runtimes[runID]
+	e.mu.Unlock()
 	run.CancelRequested = true
 	run.Status = model.RunStatusCanceled
 	run.UpdatedAt = now()
@@ -217,6 +290,12 @@ func (e *Executor) Cancel(ctx context.Context, runID string) error {
 }
 
 func (e *Executor) RetryStep(ctx context.Context, runID, stepID string) error {
+	e.mu.Lock()
+	active := e.runtimes[runID] != nil
+	e.mu.Unlock()
+	if active {
+		return fmt.Errorf("run %s is still active; cancel or wait for it before retrying a step", runID)
+	}
 	run, err := e.store.GetRun(ctx, runID)
 	if err != nil {
 		return err
@@ -225,14 +304,18 @@ func (e *Executor) RetryStep(ctx context.Context, runID, stepID string) error {
 	if err != nil {
 		return err
 	}
+	if validation := ValidateWorkflow(workflow); !validation.Valid {
+		return fmt.Errorf("workflow is invalid: %s", validation.Errors[0].Message)
+	}
 	if _, exists := nodeByID(workflow.Nodes)[stepID]; !exists {
 		return fmt.Errorf("step %s does not exist in workflow", stepID)
 	}
 	run.CurrentNodeID = stepID
-	run.Status = model.RunStatusQueued
+	run.Status = model.RunStatusRunning
 	run.Error = ""
 	run.CancelRequested = false
 	run.Paused = false
+	run.CompletedAt = ""
 	run.UpdatedAt = now()
 	if err := e.store.UpdateRun(ctx, run); err != nil {
 		return err
@@ -278,26 +361,38 @@ func (e *Executor) Events(ctx context.Context, runID string, afterSequence int64
 }
 
 func (e *Executor) RecoverInterruptedRuns(ctx context.Context) error {
-	for _, status := range []string{model.RunStatusRunning, model.RunStatusWaitingApproval} {
+	for _, status := range []string{model.RunStatusQueued, model.RunStatusRunning, model.RunStatusWaitingApproval} {
 		runs, err := e.store.ListRuns(ctx, model.RunFilter{Status: status, Limit: 200})
 		if err != nil {
 			return err
 		}
 		for _, run := range runs {
 			run.Status = model.RunStatusInterrupted
-			run.Error = "The application restarted while this run was active; review the checkpoint before trying again."
+			run.Error = "The application restarted before this run finished; review the checkpoint before trying again."
+			if status == model.RunStatusQueued {
+				run.Error = "This run was left queued by an older Centurion session; review the workflow and resume it."
+			}
+			checkpoint := map[string]any{"currentNodeID": run.CurrentNodeID}
+			if run.CurrentNodeID != "" {
+				if step, stepErr := e.store.GetRunStep(ctx, run.ID, run.CurrentNodeID); stepErr == nil {
+					checkpoint["stepStatus"] = step.Status
+					checkpoint["attempt"] = step.Attempt
+					checkpoint["threadID"] = step.ThreadID
+					checkpoint["turnID"] = step.TurnID
+				}
+			}
 			run.UpdatedAt = now()
 			if err := e.store.UpdateRun(ctx, run); err != nil {
 				return err
 			}
-			e.appendEvent(ctx, model.RunEvent{RunID: run.ID, Type: "run.recovered", Source: "orchestrator", Level: "warning", Message: run.Error})
+			e.appendEvent(ctx, model.RunEvent{RunID: run.ID, Type: "run.recovered", Source: "orchestrator", Level: "warning", Message: run.Error, Data: checkpoint})
 		}
 	}
 	return nil
 }
 
 func (e *Executor) startRuntime(run model.Run, workflow model.WorkflowDefinition, startNode string, projectRoots ...[]string) {
-	runContext, cancel := context.WithCancel(context.Background())
+	runContext, cancel := context.WithCancel(e.shutdownCtx)
 	configuredProjectRoots := make([]string, 0)
 	if len(projectRoots) > 0 {
 		configuredProjectRoots = append(configuredProjectRoots, projectRoots[0]...)
@@ -369,7 +464,11 @@ func (e *Executor) loadProjectRoots(ctx context.Context, projectID string) []str
 func (e *Executor) execute(rt *runtime, run model.Run, workflow model.WorkflowDefinition, startNode string) {
 	defer func() {
 		e.mu.Lock()
-		delete(e.runtimes, run.ID)
+		// A manual retry can replace a runtime while the old goroutine is
+		// unwinding. Never let the old goroutine delete the replacement.
+		if current := e.runtimes[run.ID]; current == rt {
+			delete(e.runtimes, run.ID)
+		}
 		e.mu.Unlock()
 	}()
 	if err := e.updateRunStatus(run.ID, model.RunStatusRunning, ""); err != nil {
@@ -442,14 +541,45 @@ func (e *Executor) execute(rt *runtime, run model.Run, workflow model.WorkflowDe
 		}
 		output, err := e.executeWithRetry(ctx, rt, run.ID, node, scope, workflow, run.Input)
 		if err != nil {
-			executionErr = err
-			break
+			// A semantic blocker is an intentional stop from an agent, not a
+			// transient node failure. Never let a workflow-level "continue" or
+			// "fallback" policy turn a refused implementation into a completed run.
+			if errors.Is(err, ErrAgentBlocked) {
+				executionErr = err
+				break
+			}
+			next, handled, policyErr := e.handleNodeError(ctx, rt, run.ID, node, err, workflow, scope)
+			if policyErr != nil {
+				executionErr = policyErr
+				break
+			}
+			if !handled {
+				executionErr = err
+				break
+			}
+			run.Output = cloneMap(scope)
+			run.CurrentNodeID = next
+			run.Paused = rt.isPaused()
+			if run.Paused {
+				run.Status = model.RunStatusPaused
+			} else {
+				run.Status = model.RunStatusRunning
+			}
+			run.UpdatedAt = now()
+			e.syncRuntimeUsage(&run, rt)
+			_ = e.store.UpdateRun(context.Background(), run)
+			current = next
+			continue
 		}
 		mergeScope(scope, node.ID, output)
 		run.Output = cloneMap(scope)
 		next, err := chooseNext(workflow.Edges, node.ID, scope)
 		if err != nil {
 			executionErr = err
+			break
+		}
+		if next == "" && node.Type == "condition" {
+			executionErr = fmt.Errorf("condition node %s did not match any outgoing edge", node.ID)
 			break
 		}
 		run.CurrentNodeID = next
@@ -475,6 +605,8 @@ func (e *Executor) execute(rt *runtime, run model.Run, workflow model.WorkflowDe
 			finalStatus = model.RunStatusCanceled
 		} else if errors.Is(executionErr, context.DeadlineExceeded) {
 			finalStatus = model.RunStatusInterrupted
+		} else if errors.Is(executionErr, ErrAgentBlocked) {
+			finalStatus = model.RunStatusBlocked
 		} else {
 			finalStatus = model.RunStatusFailed
 		}
@@ -500,6 +632,9 @@ func (e *Executor) executeParallel(ctx context.Context, rt *runtime, runID strin
 		return "", errors.New("parallel node requires at least two outgoing branches")
 	}
 	results := make([]branchResult, len(outgoing))
+	parallelCtx, cancelParallel := context.WithCancel(ctx)
+	defer cancelParallel()
+	var cancelOnce sync.Once
 	var waitGroup sync.WaitGroup
 	for index, edge := range outgoing {
 		index, edge := index, edge
@@ -509,23 +644,29 @@ func (e *Executor) executeParallel(ctx context.Context, rt *runtime, runID strin
 			select {
 			case semaphore <- struct{}{}:
 				defer func() { <-semaphore }()
-			case <-ctx.Done():
-				results[index].err = ctx.Err()
+			case <-parallelCtx.Done():
+				results[index].err = parallelCtx.Err()
 				return
 			}
 			branchScope := cloneMap(scope)
 			results[index] = branchResult{scope: branchScope}
-			joinID, err := e.executeBranch(ctx, rt, runID, edge.To, workflow, branchScope, input, semaphore)
+			joinID, err := e.executeBranch(parallelCtx, rt, runID, edge.To, workflow, branchScope, input, semaphore)
 			results[index].joinID = joinID
 			results[index].err = err
+			if err != nil {
+				// Stop sibling branches as soon as one branch fails. This avoids
+				// spending more turns or performing more side effects after the
+				// workflow is already known to fail.
+				cancelOnce.Do(cancelParallel)
+			}
 		}()
 	}
 	waitGroup.Wait()
 	joinID := ""
+	if err := preferredParallelError(ctx.Err(), results); err != nil {
+		return "", err
+	}
 	for _, result := range results {
-		if result.err != nil {
-			return "", result.err
-		}
 		if joinID == "" {
 			joinID = result.joinID
 		} else if result.joinID != joinID {
@@ -540,6 +681,31 @@ func (e *Executor) executeParallel(ctx context.Context, rt *runtime, runID strin
 	}
 	e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "parallel.completed", Source: "orchestrator", Level: "info", NodeID: parallelNode.ID, Message: "Parallel workstreams completed"})
 	return joinID, nil
+}
+
+// preferredParallelError preserves the actual failed branch when canceling it
+// causes sibling branches to report context.Canceled. Without this ordering, a
+// real file-operation failure can be mislabeled as a canceled workflow.
+func preferredParallelError(parentErr error, results []branchResult) error {
+	if parentErr != nil {
+		return parentErr
+	}
+	for _, result := range results {
+		if result.err != nil && errors.Is(result.err, ErrAgentBlocked) {
+			return result.err
+		}
+	}
+	for _, result := range results {
+		if result.err != nil && !errors.Is(result.err, context.Canceled) {
+			return result.err
+		}
+	}
+	for _, result := range results {
+		if result.err != nil {
+			return result.err
+		}
+	}
+	return nil
 }
 
 func (e *Executor) executeBranch(ctx context.Context, rt *runtime, runID, startNode string, workflow model.WorkflowDefinition, scope, input map[string]any, semaphore chan struct{}) (string, error) {
@@ -572,12 +738,26 @@ func (e *Executor) executeBranch(ctx context.Context, rt *runtime, runID, startN
 		}
 		output, err := e.executeWithRetry(ctx, rt, runID, node, scope, workflow, input)
 		if err != nil {
-			return "", err
+			if errors.Is(err, ErrAgentBlocked) {
+				return "", err
+			}
+			next, handled, policyErr := e.handleNodeError(ctx, rt, runID, node, err, workflow, scope)
+			if policyErr != nil {
+				return "", policyErr
+			}
+			if !handled {
+				return "", err
+			}
+			current = next
+			continue
 		}
 		mergeScope(scope, node.ID, output)
 		next, err := chooseNext(workflow.Edges, node.ID, scope)
 		if err != nil {
 			return "", err
+		}
+		if next == "" && node.Type == "condition" {
+			return "", fmt.Errorf("condition node %s did not match any outgoing edge", node.ID)
 		}
 		current = next
 	}
@@ -594,6 +774,9 @@ func (e *Executor) executeWithRetry(ctx context.Context, rt *runtime, runID stri
 	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := e.waitIfPaused(ctx, rt); err != nil {
+			return nil, err
+		}
 		startedAt := now()
 		e.persistStep(runID, node.ID, "running", attempt, nil, "", startedAt, "")
 		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "step.started", Source: "orchestrator", Level: "info", NodeID: node.ID, AgentID: node.AgentID, Message: node.Label, Data: map[string]any{"attempt": attempt}})
@@ -610,22 +793,109 @@ func (e *Executor) executeWithRetry(ctx context.Context, rt *runtime, runID stri
 			return output, nil
 		}
 		lastErr = err
-		e.persistStep(runID, node.ID, "failed", attempt, nil, err.Error(), startedAt, now())
-		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "step.failed", Source: "orchestrator", Level: "error", NodeID: node.ID, AgentID: node.AgentID, Message: err.Error(), Data: map[string]any{"attempt": attempt}})
-		if attempt == maxAttempts || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		stepStatus := "failed"
+		eventType := "step.failed"
+		eventLevel := "error"
+		var stepOutput map[string]any
+		var blockedErr *AgentBlockedError
+		if errors.As(err, &blockedErr) {
+			stepStatus = "blocked"
+			eventType = "step.blocked"
+			eventLevel = "warning"
+			stepOutput = blockedErr.Output
+		}
+		e.persistStep(runID, node.ID, stepStatus, attempt, stepOutput, err.Error(), startedAt, now())
+		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: eventType, Source: "orchestrator", Level: eventLevel, NodeID: node.ID, AgentID: node.AgentID, Message: err.Error(), Data: map[string]any{"attempt": attempt}})
+		if attempt == maxAttempts || errors.Is(err, ErrAgentBlocked) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			break
 		}
 		backoff := time.Duration(node.Retry.BackoffSeconds*attempt) * time.Second
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
+		if backoff > 5*time.Minute {
+			backoff = 5 * time.Minute
 		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(backoff):
+		if err := e.waitForRetry(ctx, rt, backoff); err != nil {
+			return nil, err
 		}
 	}
 	return nil, lastErr
+}
+
+func (e *Executor) waitForRetry(ctx context.Context, rt *runtime, backoff time.Duration) error {
+	deadline := time.NewTimer(backoff)
+	defer deadline.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-deadline.C:
+		return e.waitIfPaused(ctx, rt)
+	}
+}
+
+// handleNodeError applies the workflow-level error policy after a node has
+// exhausted its retry budget. It returns the next node only when the policy
+// explicitly handled the failure; the default is fail-fast.
+func (e *Executor) handleNodeError(ctx context.Context, rt *runtime, runID string, node model.WorkflowNode, nodeErr error, workflow model.WorkflowDefinition, scope map[string]any) (string, bool, error) {
+	policy := strings.ToLower(strings.TrimSpace(workflow.ErrorPolicy))
+	if policy == "" || policy == "stop" {
+		return "", false, nil
+	}
+	failureOutput := map[string]any{
+		"status": "failed",
+		"error":  nodeErr.Error(),
+	}
+	switch policy {
+	case "continue":
+		mergeScope(scope, node.ID, failureOutput)
+		next, err := chooseNext(workflow.Edges, node.ID, scope)
+		if err != nil {
+			return "", false, err
+		}
+		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "step.continued_after_error", Source: "orchestrator", Level: "warning", NodeID: node.ID, Message: "Step failed; workflow continued by policy", Data: failureOutput})
+		return next, true, nil
+	case "fallback":
+		target, _ := node.Config["fallbackNodeID"].(string)
+		target = strings.TrimSpace(target)
+		if target == "" {
+			return "", false, errors.New("fallback error policy requires a fallbackNodeID")
+		}
+		mergeScope(scope, node.ID, failureOutput)
+		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "step.fallback", Source: "orchestrator", Level: "warning", NodeID: node.ID, Message: "Step failed; workflow switched to its fallback", Data: map[string]any{"fallbackNodeID": target, "error": nodeErr.Error()}})
+		return target, true, nil
+	case "request_approval":
+		if e.requestApproval == nil {
+			return "", false, errors.New("approval broker is not configured for the workflow error policy")
+		}
+		request := model.ApprovalRequest{
+			SchemaVersion: 1,
+			Timestamp:     now(),
+			ID:            uuid.NewString(),
+			Kind:          "workflow_error",
+			Title:         "Continue after step failure?",
+			Detail:        fmt.Sprintf("%s failed: %s", node.Label, nodeErr.Error()),
+			RunID:         runID,
+			Choices:       []string{"continue", "stop"},
+		}
+		e.emitAgent(runID, "", model.AgentStateWaitingApproval, node.ID, request.Detail)
+		_ = e.updateRunStatus(runID, model.RunStatusWaitingApproval, nodeErr.Error())
+		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "approval.requested", Source: "orchestrator", Level: "warning", NodeID: node.ID, Message: request.Title, Data: map[string]any{"error": nodeErr.Error()}})
+		approved, err := e.requestApproval(ctx, request)
+		if err != nil {
+			return "", false, err
+		}
+		_ = e.updateRunStatus(runID, model.RunStatusRunning, "")
+		if !approved {
+			return "", false, nodeErr
+		}
+		mergeScope(scope, node.ID, failureOutput)
+		next, err := chooseNext(workflow.Edges, node.ID, scope)
+		if err != nil {
+			return "", false, err
+		}
+		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "step.continued_after_approval", Source: "orchestrator", Level: "warning", NodeID: node.ID, Message: "Step failure was approved for continuation"})
+		return next, true, nil
+	default:
+		return "", false, nil
+	}
 }
 
 func (e *Executor) executeNode(ctx context.Context, rt *runtime, runID string, node model.WorkflowNode, scope map[string]any, workflow model.WorkflowDefinition, input map[string]any) (map[string]any, error) {
@@ -645,13 +915,26 @@ func (e *Executor) executeNode(ctx context.Context, rt *runtime, runID string, n
 		agentMessage := "Step ended"
 		e.emitAgent(runID, agent.ID, model.AgentStateWorking, node.ID, "Executing instructions")
 		defer func() { e.emitAgent(runID, agent.ID, agentState, node.ID, agentMessage) }()
-		promptTemplates, promptErr := e.store.SystemPromptTemplates(ctx)
-		if promptErr != nil {
-			agentState = model.AgentStateError
-			agentMessage = promptErr.Error()
-			return nil, fmt.Errorf("load system prompts: %w", promptErr)
+		existingThreadID := ""
+		if previousStep, stepErr := e.store.GetRunStep(context.Background(), runID, node.ID); stepErr == nil {
+			existingThreadID = strings.TrimSpace(previousStep.ThreadID)
 		}
-		prompt := buildAgentPrompt(agent, workflow, node, input, scope, promptTemplates)
+		promptMode := "bootstrap"
+		contextPolicy := "input-and-upstream-control-projected"
+		var prompt string
+		if existingThreadID != "" {
+			promptMode = "continuation"
+			contextPolicy = "thread-continuation"
+			prompt = buildAgentContinuationPrompt(node)
+		} else {
+			promptTemplates, promptErr := e.store.SystemPromptTemplates(ctx)
+			if promptErr != nil {
+				agentState = model.AgentStateError
+				agentMessage = promptErr.Error()
+				return nil, fmt.Errorf("load system prompts: %w", promptErr)
+			}
+			prompt = buildAgentPrompt(agent, workflow, node, input, scope, promptTemplates)
+		}
 		estimatedPromptTokens := estimateTextTokens(prompt)
 		usedPromptTokens, budgetErr := rt.reservePromptTokens(estimatedPromptTokens)
 		if budgetErr != nil {
@@ -672,7 +955,7 @@ func (e *Executor) executeNode(ctx context.Context, rt *runtime, runID string, n
 			Kind:      "prompt",
 			Title:     agent.Name + " prompt",
 			Content:   prompt,
-			Metadata:  map[string]any{"runID": runID, "nodeID": node.ID, "agentID": agent.ID},
+			Metadata:  map[string]any{"runID": runID, "nodeID": node.ID, "agentID": agent.ID, "promptMode": promptMode, "threadReused": existingThreadID != ""},
 			CreatedAt: now(),
 		})
 		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "agent.started", Source: "orchestrator", Level: "info", NodeID: node.ID, AgentID: agent.ID, Message: agent.Name + " started working", Data: map[string]any{
@@ -680,26 +963,57 @@ func (e *Executor) executeNode(ctx context.Context, rt *runtime, runID string, n
 			"estimatedPromptTokens": estimatedPromptTokens,
 			"usedPromptTokens":      usedPromptTokens,
 			"promptTokenBudget":     rt.maxPromptTokens,
-			"contextPolicy":         "input-and-direct-upstream",
+			"promptMode":            promptMode,
+			"threadReused":          existingThreadID != "",
+			"contextPolicy":         contextPolicy,
 			"contextBudgetBytes":    maxAgentPromptContextBytes,
 		}})
-		existingThreadID := ""
-		if previousStep, stepErr := e.store.GetRunStep(context.Background(), runID, node.ID); stepErr == nil {
-			existingThreadID = previousStep.ThreadID
+		lastActivityKey := ""
+		emitAgentActivity := func(method string) {
+			phase := agentActivityForMethod(method)
+			key := phase.Activity + "\x00" + phase.Detail
+			if key == lastActivityKey {
+				return
+			}
+			lastActivityKey = key
+			e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "agent.activity", Source: "orchestrator", Level: "info", NodeID: node.ID, AgentID: agent.ID, Message: phase.Activity, Data: map[string]any{
+				"detail": phase.Detail,
+				"method": method,
+			}})
 		}
+		emitAgentActivity("turn/started")
 		agentContext := ctx
 		cancel := func() {}
 		if agent.MaxDurationSeconds > 0 {
 			agentContext, cancel = context.WithTimeout(ctx, time.Duration(agent.MaxDurationSeconds)*time.Second)
 		}
-		result, err := e.codex.RunAgentTurn(agentContext, agent, prompt, existingThreadID, rt.setTurn, func(notification codex.Notification) {
-			data := make(map[string]any)
-			_ = json.Unmarshal(notification.Params, &data)
-			e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "codex." + notification.Method, Source: "codex", Level: eventLevel(notification.Method), NodeID: node.ID, AgentID: agent.ID, Message: notification.Method, Data: data})
+		onTurnStarted := func(threadID, turnID string) {
+			rt.setTurn(threadID, turnID)
+			// Persist the checkpoint as soon as Codex assigns the turn. If the
+			// app closes mid-turn, recovery can show which thread was active
+			// instead of treating the step as an opaque interruption.
+			if step, stepErr := e.store.GetRunStep(context.Background(), runID, node.ID); stepErr == nil {
+				step.ThreadID = threadID
+				step.TurnID = turnID
+				_ = e.store.UpsertRunStep(context.Background(), step)
+			}
+		}
+		result, err := e.codex.RunAgentTurn(agentContext, agent, prompt, existingThreadID, onTurnStarted, func(notification codex.Notification) {
+			// Keep the run log useful without storing notification payloads. Some
+			// Codex notifications can contain private reasoning, prompt fragments,
+			// tool arguments, or file contents.
+			emitAgentActivity(notification.Method)
 		})
 		cancel()
+		emitAgentActivity("turn/completed")
 		outputBytes := rt.recordOutput(len(result.Output))
 		e.updateRunUsage(runID, usedPromptTokens, rt.maxPromptTokens, outputBytes)
+		e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "agent.output", Source: "orchestrator", Level: "info", NodeID: node.ID, AgentID: agent.ID, Message: agent.Name + " returned a result", Data: map[string]any{
+			"status":      result.Status,
+			"outputBytes": outputBytes,
+			"threadID":    result.ThreadID,
+			"turnID":      result.TurnID,
+		}})
 		if step, stepErr := e.store.GetRunStep(context.Background(), runID, node.ID); stepErr == nil {
 			step.ThreadID = result.ThreadID
 			step.TurnID = result.TurnID
@@ -727,11 +1041,20 @@ func (e *Executor) executeNode(ctx context.Context, rt *runtime, runID string, n
 		if result.Output == "" {
 			return map[string]any{"status": result.Status}, nil
 		}
-		var structured map[string]any
-		if json.Unmarshal([]byte(result.Output), &structured) == nil && structured != nil {
-			return structured, nil
+		structured := parseAgentOutput(result.Output, result.Status)
+		if failed, reason := agentOutputFailed(structured); failed {
+			agentState = model.AgentStateError
+			agentMessage = reason
+			e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "agent.failed", Source: "orchestrator", Level: "error", NodeID: node.ID, AgentID: agent.ID, Message: reason, Data: structured})
+			return nil, fmt.Errorf("%s failed workflow node %q: %s", agent.Name, node.ID, reason)
 		}
-		return map[string]any{"text": result.Output, "status": result.Status}, nil
+		if blocked, reason := agentOutputBlocked(structured); blocked {
+			agentState = model.AgentStateBlocked
+			agentMessage = reason
+			e.appendEvent(context.Background(), model.RunEvent{RunID: runID, Type: "agent.blocked", Source: "orchestrator", Level: "warning", NodeID: node.ID, AgentID: agent.ID, Message: reason, Data: structured})
+			return nil, &AgentBlockedError{AgentName: agent.Name, NodeID: node.ID, Reason: reason, Output: structured}
+		}
+		return structured, nil
 	case "condition":
 		value, err := EvaluateCondition(node.Condition, scope)
 		if err != nil {
@@ -904,10 +1227,33 @@ func (e *Executor) updateRunStatus(runID, status, errorMessage string) error {
 	if err != nil {
 		return err
 	}
+	changed := run.Status != status || run.Error != errorMessage
 	run.Status = status
 	run.Error = errorMessage
 	run.UpdatedAt = now()
-	return e.store.UpdateRun(context.Background(), run)
+	if err := e.store.UpdateRun(context.Background(), run); err != nil {
+		return err
+	}
+	if changed {
+		level := "info"
+		if status == model.RunStatusWaitingApproval {
+			level = "warning"
+		} else if status == model.RunStatusFailed || status == model.RunStatusInterrupted {
+			level = "error"
+		}
+		e.appendEvent(context.Background(), model.RunEvent{
+			RunID:   runID,
+			Type:    "run.status",
+			Source:  "orchestrator",
+			Level:   level,
+			Message: "Run status: " + status,
+			Data: map[string]any{
+				"status": status,
+				"error":  errorMessage,
+			},
+		})
+	}
+	return nil
 }
 
 func (e *Executor) appendEvent(ctx context.Context, event model.RunEvent) {
@@ -1051,19 +1397,137 @@ func runWasCanceled(dataStore *store.Store, runID string) bool {
 	return err == nil && run.CancelRequested
 }
 
-func eventLevel(method string) string {
-	if strings.Contains(method, "error") || strings.Contains(method, "failed") {
-		return "error"
+func parseAgentOutput(raw, turnStatus string) map[string]any {
+	raw = strings.TrimSpace(raw)
+	var structured map[string]any
+	if json.Unmarshal([]byte(raw), &structured) == nil && structured != nil {
+		return structured
 	}
-	if strings.Contains(method, "approval") || strings.Contains(method, "request") {
-		return "warning"
+	if candidate := extractJSONObject(raw); candidate != "" && json.Unmarshal([]byte(candidate), &structured) == nil && structured != nil {
+		if _, exists := structured["text"]; !exists {
+			structured["_rawText"] = truncateText(raw, 6000)
+		}
+		return structured
 	}
-	return "info"
+	return map[string]any{"text": raw, "status": turnStatus}
+}
+
+func extractJSONObject(value string) string {
+	start := strings.IndexByte(value, '{')
+	for start >= 0 && start < len(value) {
+		depth := 0
+		inString := false
+		escaped := false
+		for index := start; index < len(value); index++ {
+			character := value[index]
+			if inString {
+				if escaped {
+					escaped = false
+					continue
+				}
+				if character == '\\' {
+					escaped = true
+				} else if character == '"' {
+					inString = false
+				}
+				continue
+			}
+			switch character {
+			case '"':
+				inString = true
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					return value[start : index+1]
+				}
+			}
+		}
+		next := strings.IndexByte(value[start+1:], '{')
+		if next < 0 {
+			break
+		}
+		start += next + 1
+	}
+	return ""
+}
+
+func agentOutputBlocked(output map[string]any) (bool, string) {
+	if output == nil {
+		return false, ""
+	}
+	for _, key := range []string{"status", "result", "decision"} {
+		value, ok := output[key].(string)
+		if !ok {
+			continue
+		}
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		switch normalized {
+		case "blocked", "bloqueado", "bloqueada", "not_ready", "not-ready", "not_ready_for_promotion", "not-ready-for-promotion", "implementation_not_started", "implementation-not-started", "implementation_handoff_not_created", "implementation-handoff-not-created", "do_not_route_builder", "do-not-route-builder", "do_not_approve", "do-not-approve", "scope_blocked", "scope-blocked":
+			return true, agentBlockReason(output, value)
+		}
+	}
+	return false, ""
+}
+
+// agentOutputFailed separates a completed transport turn from a failed task.
+// Codex can correctly finish a turn while the agent reports that its scoped
+// operation failed. Treat those result values as workflow failures rather than
+// displaying a misleading completed state.
+func agentOutputFailed(output map[string]any) (bool, string) {
+	if output == nil {
+		return false, ""
+	}
+	for _, key := range []string{"status", "result", "decision"} {
+		value, ok := output[key].(string)
+		if !ok {
+			continue
+		}
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		switch normalized {
+		case "failed", "failure", "error", "erro", "falha", "falhou":
+			return true, agentBlockReason(output, value)
+		}
+	}
+	return false, ""
+}
+
+func agentBlockReason(output map[string]any, fallback string) string {
+	if blockers, ok := output["blockers"].([]any); ok && len(blockers) > 0 {
+		parts := make([]string, 0, minInt(len(blockers), 3))
+		for _, blocker := range blockers[:minInt(len(blockers), 3)] {
+			if text, ok := blocker.(string); ok && strings.TrimSpace(text) != "" {
+				parts = append(parts, strings.TrimSpace(text))
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "; ")
+		}
+	}
+	for _, key := range []string{"blocker", "reason", "message", "nextStep"} {
+		if text, ok := output[key].(string); ok && strings.TrimSpace(text) != "" {
+			return truncateText(strings.TrimSpace(text), 600)
+		}
+	}
+	return "agent reported " + strings.TrimSpace(fallback)
+}
+
+func isTerminalRunStatus(status string) bool {
+	switch status {
+	case model.RunStatusCompleted, model.RunStatusBlocked, model.RunStatusFailed, model.RunStatusCanceled, model.RunStatusInterrupted:
+		return true
+	default:
+		return false
+	}
 }
 
 func levelForStatus(status string) string {
 	if status == model.RunStatusCompleted {
 		return "info"
+	}
+	if status == model.RunStatusBlocked {
+		return "warning"
 	}
 	if status == model.RunStatusCanceled || status == model.RunStatusInterrupted {
 		return "warning"
@@ -1078,6 +1542,8 @@ func messageForStatus(status, errorMessage string) string {
 	switch status {
 	case model.RunStatusCompleted:
 		return "Run completed"
+	case model.RunStatusBlocked:
+		return "Run blocked: an agent reported that it could not safely continue"
 	case model.RunStatusCanceled:
 		return "Run canceled"
 	case model.RunStatusInterrupted:

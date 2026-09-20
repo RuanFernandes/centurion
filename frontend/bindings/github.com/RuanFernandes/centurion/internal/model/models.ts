@@ -14,6 +14,7 @@ export interface AgentProfile {
     "approvalProfile": string;
     "roomID": string;
     "avatarID": string;
+    "spriteID": string;
     "visualState": string;
     "maxDurationSeconds": number;
     "maxTurns": number;
@@ -87,6 +88,24 @@ export interface AuthState {
 }
 
 /**
+ * BuilderActivityEvent is a deliberately summarized view of a planner or
+ * builder turn. It reports an operational phase, never raw notification
+ * parameters or private model reasoning.
+ */
+export interface BuilderActivityEvent {
+    "schemaVersion": number;
+    "timestamp": string;
+    "sequence": number;
+    "source": string;
+    "scope": string;
+    "threadID"?: string;
+    "turnID"?: string;
+    "state": string;
+    "activity": string;
+    "detail"?: string;
+}
+
+/**
  * BuilderAgentDraft contains only declarative profile data. TemporaryID is
  * used for references inside the proposed workflow and is replaced by a
  * server-generated UUID when the proposal is applied.
@@ -125,16 +144,17 @@ export interface BuilderApplyResult {
 export interface BuilderProposal {
     "schemaVersion": number;
     "summary": string;
+    "executionBrief"?: string;
     "notes"?: string[] | null;
     "agents": BuilderAgentDraft[] | null;
     "workflow"?: WorkflowDefinition | null;
 }
 
 /**
- * BuilderRequest is the small, user-authored input sent to the in-app Codex
- * configuration builder. ThreadID is kept in memory by AppService so a
- * follow-up stays in the same builder conversation without exposing arbitrary
- * Codex threads to the frontend.
+ * BuilderRequest is the user-authored input sent to the in-app Codex
+ * configuration builder. Handoff marks the controlled Planner-to-Builder
+ * transition, which is allowed a larger bounded payload than a direct build
+ * request because it carries a compacted planning transcript.
  */
 export interface BuilderRequest {
     "prompt": string;
@@ -142,12 +162,40 @@ export interface BuilderRequest {
     "threadID"?: string;
     "modelID"?: string;
     "reasoningEffort"?: string;
+    "subagentApprovalProfile"?: string;
+    "handoff"?: boolean;
 }
 
 export interface BuilderResponse {
     "threadID": string;
     "reply": string;
     "proposal": BuilderProposal;
+}
+
+/**
+ * BuilderStatus lets the UI reconnect to a planning or build request after
+ * navigation. The final response is retained in memory until the next
+ * request, while private notification payloads and reasoning text are never
+ * stored here.
+ */
+export interface BuilderStatus {
+    "schemaVersion": number;
+    "timestamp": string;
+    "sequence": number;
+    "source": string;
+    "requestID": string;
+    "projectID"?: string;
+    "scope": string;
+    "state": string;
+    "activity": string;
+    "detail"?: string;
+    "threadID"?: string;
+    "turnID"?: string;
+    "startedAt": string;
+    "updatedAt": string;
+    "error"?: string;
+    "planningResponse"?: PlanningResponse | null;
+    "builderResponse"?: BuilderResponse | null;
 }
 
 export interface CodexNotification {
@@ -173,6 +221,26 @@ export interface HistoryFilter {
     "projectID"?: string;
     "kind"?: string;
     "limit"?: number;
+}
+
+export interface LearnSystemRequest {
+    "projectID"?: string;
+    "modelID"?: string;
+    "reasoningEffort"?: string;
+}
+
+export interface LearnSystemResult {
+    "projectID": string;
+    "status": string;
+    "primaryFolder": string;
+    "docsPath": string;
+    "docsFiles": string[] | null;
+    "missingFiles"?: string[] | null;
+    "modelID"?: string;
+    "reasoningEffort"?: string;
+    "threadID"?: string;
+    "summary"?: string;
+    "durationMs": number;
 }
 
 export interface MCPServer {
@@ -220,8 +288,10 @@ export interface ModelsUpdatedEvent {
 
 /**
  * PlanningRequest is a user-authored message sent to the read-only planning
- * room. The selected agent contributes its identity and model, but the
- * service strips workspace and tool access before opening the Codex turn.
+ * room. The selected agent contributes its identity and instructions; an
+ * empty model selection delegates model and automatic-effort resolution to
+ * the user's Codex App Server configuration. Workspace and tool access are
+ * always stripped before opening the Codex turn.
  */
 export interface PlanningRequest {
     "prompt": string;
@@ -324,6 +394,23 @@ export interface RunFilter {
     "limit"?: number;
 }
 
+/**
+ * RunStep is the durable checkpoint for one workflow node. It is exposed to
+ * the Office inspector so users can understand what each agent actually did.
+ */
+export interface RunStep {
+    "runID": string;
+    "nodeID": string;
+    "status": string;
+    "attempt": number;
+    "threadID"?: string;
+    "turnID"?: string;
+    "output"?: { [_ in string]?: any } | null;
+    "error"?: string;
+    "startedAt"?: string;
+    "completedAt"?: string;
+}
+
 export interface RunUpdateEvent {
     "schemaVersion": number;
     "timestamp": string;
@@ -399,6 +486,7 @@ export interface WorkflowDefinition {
     "name": string;
     "version": number;
     "description"?: string;
+    "executionBrief"?: string;
     "entryNodeID": string;
     "nodes": WorkflowNode[] | null;
     "edges": WorkflowEdge[] | null;
@@ -427,6 +515,7 @@ export interface WorkflowNode {
     "type": string;
     "label": string;
     "agentID"?: string;
+    "prompt"?: string;
     "condition"?: string;
     "toolName"?: string;
     "artifactPath"?: string;

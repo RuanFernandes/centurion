@@ -1,0 +1,5 @@
+# Centurion local state
+state/
+*.db
+*.db-*
+logs/

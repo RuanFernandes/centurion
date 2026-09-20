@@ -21,6 +21,15 @@ export function CancelRun(runID: string): $CancellablePromise<void> {
     return $Call.ByID(56584525, runID);
 }
 
+/**
+ * ClearBuilderStatus dismisses a completed or failed result after the user
+ * has reviewed, discarded, or applied it. An active Codex turn cannot be
+ * dismissed, which prevents the UI from hiding a request that is still live.
+ */
+export function ClearBuilderStatus(): $CancellablePromise<void> {
+    return $Call.ByID(3555211644);
+}
+
 export function Close(): $CancellablePromise<void> {
     return $Call.ByID(2836621974);
 }
@@ -78,6 +87,16 @@ export function GetAuthState(): $CancellablePromise<model$0.AuthState> {
     return $Call.ByID(4001352113);
 }
 
+/**
+ * GetBuilderStatus returns the current Builder job, including its last safe
+ * activity and completed response. It is intentionally in-memory: the Codex
+ * turn itself belongs to the current App Server process, while the UI can
+ * reconnect to this snapshot whenever its route is mounted again.
+ */
+export function GetBuilderStatus(): $CancellablePromise<model$0.BuilderStatus> {
+    return $Call.ByID(1643541003);
+}
+
 export function GetDiagnostics(): $CancellablePromise<string[] | null> {
     return $Call.ByID(1807514478);
 }
@@ -90,8 +109,21 @@ export function GetRunEvents(runID: string, afterSequence: number): $Cancellable
     return $Call.ByID(961779978, runID, afterSequence);
 }
 
+export function GetRunSteps(runID: string): $CancellablePromise<model$0.RunStep[] | null> {
+    return $Call.ByID(3965621530, runID);
+}
+
 export function GetRuntimeStatus(): $CancellablePromise<model$0.RuntimeStatus> {
     return $Call.ByID(4176624);
+}
+
+/**
+ * LearnProjectSystem performs one tool-first documentation pass. The initial
+ * request contains only a compact instruction and configured paths; source
+ * contents stay behind Codex tools on the local workspace boundary.
+ */
+export function LearnProjectSystem(request: model$0.LearnSystemRequest): $CancellablePromise<model$0.LearnSystemResult> {
+    return $Call.ByID(3695475488, request);
 }
 
 export function ListAgents(): $CancellablePromise<model$0.AgentProfile[] | null> {
@@ -149,8 +181,9 @@ export function PauseRun(runID: string): $CancellablePromise<void> {
 /**
  * PlanWithCodex keeps the user in a read-only conversation with a planning
  * lead before the configuration builder is asked to produce JSON. An
- * existing agent may supply the identity, role, model, and instructions, but
- * this turn never receives workspace roots or tools.
+ * existing agent may supply the identity, role, and instructions, while model
+ * selection comes from the request or the user's Codex configuration. This
+ * turn never receives workspace roots or tools.
  */
 export function PlanWithCodex(request: model$0.PlanningRequest): $CancellablePromise<model$0.PlanningResponse> {
     return $Call.ByID(1023814788, request);

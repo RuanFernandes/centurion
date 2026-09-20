@@ -472,6 +472,13 @@ func (a *AppServer) RunAgentTurn(ctx context.Context, agent model.AgentProfile, 
 	return a.runAgentTurn(ctx, agent, prompt, existingThreadID, nil, onTurnStarted, onEvent)
 }
 
+func (a *AppServer) AgentForThread(threadID string) (string, bool) {
+	if a == nil {
+		return "", false
+	}
+	return a.sessions.AgentForThread(threadID)
+}
+
 // RunAgentTurnWithOutputSchema uses the stable turn-level structured output
 // contract when the installed App Server supports it. The regular executor
 // keeps using RunAgentTurn because its node outputs are intentionally free-form.
@@ -483,25 +490,26 @@ func (a *AppServer) runAgentTurn(ctx context.Context, agent model.AgentProfile, 
 	if err := a.CanRun(); err != nil {
 		return AgentTurnResult{}, err
 	}
+	existingThreadID = strings.TrimSpace(existingThreadID)
 	session, err := a.sessions.Open(agent.ID, existingThreadID)
 	if err != nil {
 		return AgentTurnResult{}, err
 	}
 	defer a.sessions.Close(session.ID)
+	isNewThread := existingThreadID == ""
 	threadID := existingThreadID
+	sandbox, sandboxPolicy := agentSandbox(agent)
 	if threadID == "" {
 		params := map[string]any{
 			"approvalPolicy": security.ApprovalPolicy(agent.ApprovalProfile),
 			"serviceName":    "centurion",
+			"sandbox":        sandbox,
 		}
 		if agent.ModelID != "" {
 			params["model"] = agent.ModelID
 		}
 		if len(agent.WorkspaceRoots) > 0 {
 			params["cwd"] = agent.WorkspaceRoots[0]
-			params["sandbox"] = "workspace-write"
-		} else {
-			params["sandbox"] = "read-only"
 		}
 		var result struct {
 			Thread struct {
@@ -529,16 +537,11 @@ func (a *AppServer) runAgentTurn(ctx context.Context, agent model.AgentProfile, 
 		"threadId": threadID,
 		"input":    []map[string]any{{"type": "text", "text": prompt}},
 	}
-	if agent.ModelID != "" {
-		params["model"] = agent.ModelID
-	}
-	if agent.ReasoningEffort != "" {
-		params["effort"] = agent.ReasoningEffort
-	}
+	addInitialTurnOverrides(params, agent, isNewThread)
 	if len(agent.WorkspaceRoots) > 0 {
 		params["cwd"] = agent.WorkspaceRoots[0]
-		params["sandboxPolicy"] = security.SandboxPolicy(agent.WorkspaceRoots, false)
 	}
+	params["sandboxPolicy"] = sandboxPolicy
 	if outputSchema != nil {
 		params["outputSchema"] = outputSchema
 	}
@@ -591,6 +594,42 @@ func (a *AppServer) runAgentTurn(ctx context.Context, agent model.AgentProfile, 
 				return result, nil
 			}
 		}
+	}
+}
+
+// agentSandbox maps Centurion's capability policy to the App Server sandbox.
+// ToolAllowlist entries are Centurion policy IDs, not literal App Server tool
+// names. File-write capability is nevertheless enforceable at the sandbox
+// boundary, so profiles without it cannot modify their workspace.
+func agentSandbox(agent model.AgentProfile) (string, map[string]any) {
+	if agentCanWriteWorkspace(agent.ToolAllowlist) && len(agent.WorkspaceRoots) > 0 {
+		return "workspaceWrite", security.SandboxPolicy(agent.WorkspaceRoots, false)
+	}
+	return "readOnly", security.ReadOnlySandboxPolicy(agent.WorkspaceRoots)
+}
+
+func agentCanWriteWorkspace(permissions []string) bool {
+	for _, permission := range permissions {
+		if strings.EqualFold(strings.TrimSpace(permission), "files.write") {
+			return true
+		}
+	}
+	return false
+}
+
+// addInitialTurnOverrides sets model configuration once when a thread is
+// created. App Server persists turn-level model and effort settings on that
+// thread, so repeating them after thread/resume adds noise and can override a
+// configuration the user intentionally established in the conversation.
+func addInitialTurnOverrides(params map[string]any, agent model.AgentProfile, isNewThread bool) {
+	if !isNewThread {
+		return
+	}
+	if agent.ModelID != "" {
+		params["model"] = agent.ModelID
+	}
+	if agent.ReasoningEffort != "" {
+		params["effort"] = agent.ReasoningEffort
 	}
 }
 

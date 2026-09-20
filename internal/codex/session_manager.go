@@ -84,6 +84,23 @@ func (m *SessionManager) Touch(sessionID, threadID string) {
 	m.sessions[sessionID] = session
 }
 
+// AgentForThread resolves the logical agent that owns a live Codex thread.
+// This is used for approval routing before the durable run-step checkpoint
+// necessarily has the latest turn ID.
+func (m *SessionManager) AgentForThread(threadID string) (string, bool) {
+	if m == nil || strings.TrimSpace(threadID) == "" {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, session := range m.sessions {
+		if session.ThreadID == threadID {
+			return session.AgentID, true
+		}
+	}
+	return "", false
+}
+
 func (m *SessionManager) Close(sessionID string) {
 	if m == nil || strings.TrimSpace(sessionID) == "" {
 		return

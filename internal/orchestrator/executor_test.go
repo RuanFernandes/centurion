@@ -1,7 +1,9 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,7 +44,18 @@ func TestRuntimeEnforcesPromptTokenBudget(t *testing.T) {
 	}
 }
 
-func TestAgentPromptUsesOnlyDirectUpstreamOutputs(t *testing.T) {
+func TestPreferredParallelErrorPreservesFailureOverSiblingCancellation(t *testing.T) {
+	failure := errors.New("workspace write failed")
+	got := preferredParallelError(nil, []branchResult{
+		{err: context.Canceled},
+		{err: failure},
+	})
+	if !errors.Is(got, failure) {
+		t.Fatalf("expected actual branch failure, got %v", got)
+	}
+}
+
+func TestAgentPromptUsesOnlyReachableUpstreamOutputs(t *testing.T) {
 	workflow := model.WorkflowDefinition{
 		Edges: []model.WorkflowEdge{
 			{ID: "edge-input", From: "input", To: "research"},
@@ -75,6 +88,42 @@ func TestAgentPromptUsesOnlyDirectUpstreamOutputs(t *testing.T) {
 	}
 }
 
+func TestAgentPromptCarriesContextThroughControlNodes(t *testing.T) {
+	workflow := model.WorkflowDefinition{
+		Nodes: []model.WorkflowNode{
+			{ID: "research", Type: "agent"},
+			{ID: "quality", Type: "condition"},
+			{ID: "join", Type: "join"},
+			{ID: "build", Type: "agent"},
+			{ID: "review", Type: "agent"},
+		},
+		Edges: []model.WorkflowEdge{
+			{ID: "research-quality", From: "research", To: "quality"},
+			{ID: "quality-build", From: "quality", To: "build"},
+			{ID: "review-join", From: "review", To: "join"},
+			{ID: "build-join", From: "build", To: "join"},
+			{ID: "join-next", From: "join", To: "review"},
+		},
+	}
+	scope := map[string]any{
+		"research": map[string]any{"plan": "research-output"},
+		"quality":  map[string]any{"result": true},
+		"build":    map[string]any{"code": "build-output"},
+		"review":   map[string]any{"notes": "review-output"},
+		"join":     map[string]any{"status": "completed"},
+	}
+
+	conditionPrompt := buildAgentPrompt(model.AgentProfile{Name: "Builder"}, workflow, model.WorkflowNode{ID: "build"}, nil, scope)
+	if !strings.Contains(conditionPrompt, "research-output") || !strings.Contains(conditionPrompt, "quality") {
+		t.Fatalf("agent after condition lost upstream context: %s", conditionPrompt)
+	}
+
+	joinPrompt := buildAgentPrompt(model.AgentProfile{Name: "Reviewer"}, workflow, model.WorkflowNode{ID: "review"}, nil, scope)
+	if !strings.Contains(joinPrompt, "build-output") || !strings.Contains(joinPrompt, "review-output") {
+		t.Fatalf("agent after join lost branch context: %s", joinPrompt)
+	}
+}
+
 func TestAgentPromptUsesConfiguredSystemPromptBlocks(t *testing.T) {
 	prompt := buildAgentPrompt(model.AgentProfile{
 		Name:          "Writer",
@@ -98,6 +147,38 @@ func TestAgentPromptUsesConfiguredSystemPromptBlocks(t *testing.T) {
 	}
 }
 
+func TestAgentPromptIncludesExecutionBriefAndNodeTask(t *testing.T) {
+	prompt := buildAgentPrompt(
+		model.AgentProfile{Name: "Implementation Builder", Role: "Backend implementer"},
+		model.WorkflowDefinition{ExecutionBrief: "Build the agreed ProspectOS backend."},
+		model.WorkflowNode{ID: "build", Prompt: "Implement the API and validate it with tests."},
+		nil,
+		nil,
+	)
+	if !strings.Contains(prompt, "Build the agreed ProspectOS backend.") {
+		t.Fatalf("execution brief was not included: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Implement the API and validate it with tests.") {
+		t.Fatalf("node task was not included: %q", prompt)
+	}
+}
+
+func TestAgentContinuationPromptDoesNotRepeatTheFullWorkflowTask(t *testing.T) {
+	node := model.WorkflowNode{
+		ID:     "implement-api",
+		Label:  "Implement API",
+		Prompt: "FULL_NODE_TASK_MUST_NOT_BE_REPEATED " + strings.Repeat("detail ", 1_000),
+	}
+
+	prompt := buildAgentContinuationPrompt(node)
+	if !strings.Contains(prompt, "implement-api") || !strings.Contains(prompt, "Implement API") {
+		t.Fatalf("continuation prompt lost the step identity: %q", prompt)
+	}
+	if strings.Contains(prompt, "FULL_NODE_TASK_MUST_NOT_BE_REPEATED") {
+		t.Fatalf("continuation prompt repeated the full original task: %q", prompt)
+	}
+}
+
 func TestCompactJSONStaysWithinBudgetAndValid(t *testing.T) {
 	value := map[string]any{
 		"title":   "large result",
@@ -117,8 +198,67 @@ func TestCompactJSONStaysWithinBudgetAndValid(t *testing.T) {
 
 func TestPromptToolsAreDeterministicAndDeduplicated(t *testing.T) {
 	got := promptTools([]string{"git", "filesystem", "git", "  shell  "})
-	if got != "filesystem, git, shell" {
+	if !strings.Contains(got, "- filesystem:") || !strings.Contains(got, "- git:") || !strings.Contains(got, "- shell:") {
 		t.Fatalf("unexpected tool list: %q", got)
+	}
+	if !strings.Contains(got, "not literal Codex tool names") {
+		t.Fatalf("tool capability guidance was omitted: %q", got)
+	}
+}
+
+func TestPromptToolsExplainsFileWriteCapability(t *testing.T) {
+	got := promptTools([]string{"files.read", "files.write"})
+	if !strings.Contains(got, "files.write: create or modify files") {
+		t.Fatalf("file-write capability was not rendered: %q", got)
+	}
+	if !strings.Contains(got, "minimal workspace edit") {
+		t.Fatalf("file-write guidance was not rendered: %q", got)
+	}
+}
+
+func TestAgentPromptEndsWithFileWriteRuntimeGuidance(t *testing.T) {
+	prompt := buildAgentPrompt(
+		model.AgentProfile{ToolAllowlist: []string{"files.read", "files.write"}},
+		model.WorkflowDefinition{},
+		model.WorkflowNode{Prompt: "Do not run commands outside the scoped task."},
+		nil,
+		nil,
+	)
+	nodeTaskOffset := strings.Index(prompt, "Do not run commands outside the scoped task.")
+	runtimeOffset := strings.Index(prompt, "Centurion runtime permission interpretation:")
+	if nodeTaskOffset < 0 || runtimeOffset <= nodeTaskOffset {
+		t.Fatalf("runtime capability guidance must follow the node task: %q", prompt)
+	}
+}
+
+func TestParseAgentOutputExtractsStructuredJSONAfterPreamble(t *testing.T) {
+	output := "I inspected the workspace.\n{\"status\":\"blocked\",\"result\":\"implementation_not_started\",\"blockers\":[\"No approved brief\"]}"
+	parsed := parseAgentOutput(output, "completed")
+	if parsed["status"] != "blocked" || parsed["result"] != "implementation_not_started" {
+		t.Fatalf("structured result was not extracted: %#v", parsed)
+	}
+	blocked, reason := agentOutputBlocked(parsed)
+	if !blocked || !strings.Contains(reason, "No approved brief") {
+		t.Fatalf("expected a blocking result, got blocked=%v reason=%q", blocked, reason)
+	}
+}
+
+func TestCompletedTurnWithBlockingAgentResultDoesNotLookSuccessful(t *testing.T) {
+	parsed := parseAgentOutput(`{"status":"completed","decision":"do_not_route_builder","nextStep":"Define a bounded scope first."}`, "completed")
+	blocked, reason := agentOutputBlocked(parsed)
+	if !blocked || !strings.Contains(reason, "Define a bounded scope first") {
+		t.Fatalf("expected semantic blocker to stop the workflow: blocked=%v reason=%q", blocked, reason)
+	}
+}
+
+func TestCompletedTurnWithLocalizedFailureResultFailsTheWorkflow(t *testing.T) {
+	parsed := parseAgentOutput(`{"status":"falha","blocker":"Arquivo não alterado."}`, "completed")
+	failed, reason := agentOutputFailed(parsed)
+	if !failed || !strings.Contains(reason, "Arquivo não alterado") {
+		t.Fatalf("expected a semantic failure, got failed=%v reason=%q", failed, reason)
+	}
+	if blocked, _ := agentOutputBlocked(parsed); blocked {
+		t.Fatalf("a failure result must not be downgraded to blocked: %#v", parsed)
 	}
 }
 

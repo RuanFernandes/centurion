@@ -3,7 +3,49 @@ package codex
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/RuanFernandes/centurion/internal/model"
 )
+
+func TestAddInitialTurnOverridesOnlyConfiguresNewThreads(t *testing.T) {
+	agent := model.AgentProfile{ModelID: "gpt-5.6-luna", ReasoningEffort: "max"}
+
+	initial := map[string]any{}
+	addInitialTurnOverrides(initial, agent, true)
+	if initial["model"] != "gpt-5.6-luna" || initial["effort"] != "max" {
+		t.Fatalf("initial turn did not retain explicit user selection: %#v", initial)
+	}
+
+	resumed := map[string]any{}
+	addInitialTurnOverrides(resumed, agent, false)
+	if len(resumed) != 0 {
+		t.Fatalf("resumed turn should inherit its thread configuration, got %#v", resumed)
+	}
+}
+
+func TestAgentSandboxFollowsFileWriteCapability(t *testing.T) {
+	writer := model.AgentProfile{
+		WorkspaceRoots: []string{"C:\\workspace"},
+		ToolAllowlist:  []string{"files.read", "files.write"},
+	}
+	mode, policy := agentSandbox(writer)
+	if mode != "workspaceWrite" || policy["type"] != "workspaceWrite" {
+		t.Fatalf("writer received the wrong sandbox: mode=%q policy=%#v", mode, policy)
+	}
+
+	reader := model.AgentProfile{
+		WorkspaceRoots: []string{"C:\\workspace"},
+		ToolAllowlist:  []string{"files.read"},
+	}
+	mode, policy = agentSandbox(reader)
+	if mode != "readOnly" || policy["type"] != "readOnly" {
+		t.Fatalf("reader received the wrong sandbox: mode=%q policy=%#v", mode, policy)
+	}
+	access, ok := policy["access"].(map[string]any)
+	if !ok || access["type"] != "restricted" {
+		t.Fatalf("reader access was not restricted to its workspace: %#v", policy)
+	}
+}
 
 func TestBuildRateLimitSnapshotSupportsSecondaryAndMultipleBuckets(t *testing.T) {
 	result := rateLimitResponsePayload{

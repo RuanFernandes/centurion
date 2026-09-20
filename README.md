@@ -37,6 +37,7 @@ Centurion turns a collection of prompts into an explicit operating system for ag
 
 - Preset-based agent creation with editable role and instructions.
 - Per-agent model and reasoning-effort selection from the account's dynamic Codex catalog.
+- The Build with Codex account-default option leaves model and automatic effort resolution to the user's Codex CLI/App Server configuration; the catalog's marked default is not used as a substitute.
 - Full access and Request approval access profiles.
 - Multi-select tool permissions and MCP assignment.
 - Workspace-root restrictions and persistent summarized memory.
@@ -50,6 +51,8 @@ Centurion turns a collection of prompts into an explicit operating system for ag
 - Bounded loops, retry limits, exponential backoff, per-node timeouts, and global run limits.
 - Import/export of versioned workflow JSON.
 - Save, validate, run, pause, resume, cancel, retry, and steer operations.
+
+In the current alpha, direct `tool` nodes are approval-gated orchestration checkpoints; actual MCP/tool execution is performed by Codex agent turns with the selected agent permissions. Restart recovery persists the last thread/turn checkpoint and marks uncertain work as interrupted instead of replaying it silently.
 
 ### Codex integration
 
@@ -69,6 +72,8 @@ Centurion turns a collection of prompts into an explicit operating system for ag
 
 - Embedded terminal and searchable history for prompts, conversations, projects, runs, and terminal actions.
 - Accessible office states with text labels, visible focus, keyboard actions, high-contrast semantics, and reduced-motion support.
+- Windows system tray lifecycle: closing the window hides Centurion without stopping Codex or active runs; left-click reopens it, and the context menu provides **Open Centurion** and **Exit Centurion**.
+- The tray tooltip shows the latest active workflow and status, including approval waits and terminal outcomes.
 
 ## Architecture
 
@@ -116,6 +121,8 @@ Centurion starts and supervises codex app-server locally. The Codex CLI/App Serv
     wails3 dev
 
 Centurion reuses the Codex session from the local machine. If the runtime reports that it is unauthenticated, run `codex login` in a normal terminal, then reload or restart Centurion. The selected Codex account determines the available models, reasoning efforts, MCP authentication, usage limits, and rate limits.
+
+The read-only Planning room accepts detailed briefs up to 64 KiB. This is an application safety boundary, not a claim of unlimited Codex context: the selected model's context window, account usage, and rate limits still apply.
 
 ## Project storage
 

@@ -24,11 +24,14 @@ import (
 type Store struct {
 	db       *sql.DB
 	configMu sync.Mutex
+	eventMu  sync.Mutex
 }
 
 const (
-	systemPromptOverridesKey = "orchestrator.system_prompts"
-	activeProjectSettingKey  = "workspace.active_project_id"
+	systemPromptOverridesKey       = "orchestrator.system_prompts"
+	activeProjectSettingKey        = "workspace.active_project_id"
+	maxHistoryContentRunes         = 16_000
+	maxPlanningHistoryContentRunes = 64 * 1024
 )
 
 type storedSystemPromptOverride struct {
@@ -36,18 +39,7 @@ type storedSystemPromptOverride struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
-type RunStep struct {
-	RunID       string
-	NodeID      string
-	Status      string
-	Attempt     int
-	ThreadID    string
-	TurnID      string
-	Output      map[string]any
-	Error       string
-	StartedAt   string
-	CompletedAt string
-}
+type RunStep = model.RunStep
 
 func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
@@ -122,6 +114,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			approval_profile TEXT NOT NULL DEFAULT 'on_request',
 			room_id TEXT NOT NULL DEFAULT 'main',
 			avatar_id TEXT NOT NULL DEFAULT 'operator',
+			sprite_id TEXT NOT NULL DEFAULT '',
 			visual_state TEXT NOT NULL DEFAULT 'idle',
 			max_duration_seconds INTEGER NOT NULL DEFAULT 1800,
 			max_turns INTEGER NOT NULL DEFAULT 12,
@@ -258,6 +251,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		definition string
 	}{
 		{table: "agents", name: "project_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "agents", name: "sprite_id", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "workflows", name: "project_id", definition: "TEXT NOT NULL DEFAULT ''"},
 		{table: "runs", name: "prompt_tokens_used", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{table: "runs", name: "prompt_token_budget", definition: "INTEGER NOT NULL DEFAULT 0"},
@@ -348,14 +342,14 @@ func (s *Store) seedDefaultCatalog(ctx context.Context, project model.Project) e
 			ID: "agent-architect", ProjectID: project.ID, Name: "Mara", Role: "Systems architect",
 			Instructions:   "Define a small, safe, and verifiable approach. Return decisions and risks in an objective format.",
 			WorkspaceRoots: roots, ToolAllowlist: []string{"files.read", "git.diff"}, ApprovalProfile: "on_request",
-			RoomID: "strategy", AvatarID: "architect", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1200, MaxTurns: 8, MaxAttempts: 2,
+			RoomID: "strategy", AvatarID: "architect", SpriteID: "sprite-0", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1200, MaxTurns: 8, MaxAttempts: 2,
 			CreatedAt: nowValue, UpdatedAt: nowValue,
 		},
 		{
 			ID: "agent-builder", ProjectID: project.ID, Name: "Nico", Role: "Software implementer",
 			Instructions:   "Implement only inside the allowed workspace. Validate changes with tests and report any blocker.",
 			WorkspaceRoots: roots, ToolAllowlist: []string{"files.read", "files.write", "shell.test", "git.diff"}, ApprovalProfile: "on_request",
-			RoomID: "workshop", AvatarID: "builder", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1800, MaxTurns: 12, MaxAttempts: 2,
+			RoomID: "workshop", AvatarID: "builder", SpriteID: "sprite-2", VisualState: model.AgentStateIdle, MaxDurationSeconds: 1800, MaxTurns: 12, MaxAttempts: 2,
 			CreatedAt: nowValue, UpdatedAt: nowValue,
 		},
 	}
@@ -613,11 +607,11 @@ type sqlExecer interface {
 }
 
 func insertAgent(ctx context.Context, execer sqlExecer, agent model.AgentProfile) error {
-	roots, err := jsonString(agent.WorkspaceRoots)
+	roots, err := agentListJSON(agent.WorkspaceRoots)
 	if err != nil {
 		return err
 	}
-	tools, err := jsonString(agent.ToolAllowlist)
+	tools, err := agentListJSON(agent.ToolAllowlist)
 	if err != nil {
 		return err
 	}
@@ -628,10 +622,10 @@ func insertAgent(ctx context.Context, execer sqlExecer, agent model.AgentProfile
 		agent.UpdatedAt = agent.CreatedAt
 	}
 	_, err = execer.ExecContext(ctx, `
-		INSERT INTO agents (id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
-		agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, agent.CreatedAt, agent.UpdatedAt)
+		INSERT INTO agents (id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, sprite_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, sprite_id=excluded.sprite_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
+		agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.SpriteID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, agent.CreatedAt, agent.UpdatedAt)
 	return err
 }
 
@@ -753,11 +747,11 @@ func (s *Store) migrateLegacyLanguage(ctx context.Context) error {
 }
 
 func (s *Store) SaveAgent(ctx context.Context, agent model.AgentProfile) error {
-	roots, err := jsonString(agent.WorkspaceRoots)
+	roots, err := agentListJSON(agent.WorkspaceRoots)
 	if err != nil {
 		return err
 	}
-	tools, err := jsonString(agent.ToolAllowlist)
+	tools, err := agentListJSON(agent.ToolAllowlist)
 	if err != nil {
 		return err
 	}
@@ -768,10 +762,10 @@ func (s *Store) SaveAgent(ctx context.Context, agent model.AgentProfile) error {
 		agent.UpdatedAt = now()
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO agents (id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
-		agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, agent.CreatedAt, agent.UpdatedAt)
+		INSERT INTO agents (id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, sprite_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, sprite_id=excluded.sprite_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
+		agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.SpriteID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, agent.CreatedAt, agent.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -806,7 +800,7 @@ func (s *Store) ListAgentsForProject(ctx context.Context, projectID string) ([]m
 }
 
 func (s *Store) listAgents(ctx context.Context, projectID string) ([]model.AgentProfile, error) {
-	query := `SELECT id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at FROM agents`
+	query := `SELECT id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, sprite_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at FROM agents`
 	args := make([]any, 0, 1)
 	if projectID != "" {
 		query += ` WHERE project_id = ? OR project_id = ''`
@@ -830,7 +824,7 @@ func (s *Store) listAgents(ctx context.Context, projectID string) ([]model.Agent
 }
 
 func (s *Store) GetAgent(ctx context.Context, id string) (model.AgentProfile, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at FROM agents WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, sprite_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at FROM agents WHERE id = ?`, id)
 	return scanAgent(row)
 }
 
@@ -876,11 +870,11 @@ func (s *Store) ApplyBuilderProposal(ctx context.Context, agents []model.AgentPr
 		if strings.TrimSpace(agent.ID) == "" || strings.TrimSpace(agent.Name) == "" || strings.TrimSpace(agent.Role) == "" {
 			return errors.New("builder agent is missing id, name or role")
 		}
-		roots, err := jsonString(agent.WorkspaceRoots)
+		roots, err := agentListJSON(agent.WorkspaceRoots)
 		if err != nil {
 			return err
 		}
-		tools, err := jsonString(agent.ToolAllowlist)
+		tools, err := agentListJSON(agent.ToolAllowlist)
 		if err != nil {
 			return err
 		}
@@ -893,10 +887,10 @@ func (s *Store) ApplyBuilderProposal(ctx context.Context, agents []model.AgentPr
 			updatedAt = createdAt
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO agents (id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
-			agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, createdAt, updatedAt); err != nil {
+			INSERT INTO agents (id, project_id, name, role, instructions, model_id, reasoning_effort, workspace_roots_json, tool_allowlist_json, approval_profile, room_id, avatar_id, sprite_id, visual_state, max_duration_seconds, max_turns, max_attempts, memory_summary, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, name=excluded.name, role=excluded.role, instructions=excluded.instructions, model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort, workspace_roots_json=excluded.workspace_roots_json, tool_allowlist_json=excluded.tool_allowlist_json, approval_profile=excluded.approval_profile, room_id=excluded.room_id, avatar_id=excluded.avatar_id, sprite_id=excluded.sprite_id, visual_state=excluded.visual_state, max_duration_seconds=excluded.max_duration_seconds, max_turns=excluded.max_turns, max_attempts=excluded.max_attempts, memory_summary=excluded.memory_summary, updated_at=excluded.updated_at`,
+			agent.ID, agent.ProjectID, agent.Name, agent.Role, agent.Instructions, agent.ModelID, agent.ReasoningEffort, roots, tools, agent.ApprovalProfile, agent.RoomID, agent.AvatarID, agent.SpriteID, agent.VisualState, agent.MaxDurationSeconds, agent.MaxTurns, agent.MaxAttempts, agent.MemorySummary, createdAt, updatedAt); err != nil {
 			return err
 		}
 	}
@@ -1129,8 +1123,12 @@ func (s *Store) AppendHistory(ctx context.Context, entry model.HistoryEntry) err
 	}
 	entry.Title = security.RedactSensitiveText(entry.Title)
 	entry.Content = security.RedactSensitiveText(entry.Content)
-	if len([]rune(entry.Content)) > 16000 {
-		entry.Content = string([]rune(entry.Content)[:16000]) + "\n[truncated]"
+	maxContentRunes := maxHistoryContentRunes
+	if entry.Kind == "planning_prompt" || entry.Kind == "planning_response" {
+		maxContentRunes = maxPlanningHistoryContentRunes
+	}
+	if len([]rune(entry.Content)) > maxContentRunes {
+		entry.Content = string([]rune(entry.Content)[:maxContentRunes]) + "\n[truncated]"
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO history (id, project_id, kind, title, content, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, entry.ID, entry.ProjectID, entry.Kind, entry.Title, entry.Content, metadata, entry.CreatedAt)
 	return err
@@ -1318,6 +1316,11 @@ func (s *Store) AppendRunEvent(ctx context.Context, event model.RunEvent) (model
 	if err != nil {
 		return event, err
 	}
+	// Sequence allocation is intentionally serialized per Store. SQLite
+	// serializes writers, but MAX(sequence)+1 performed by concurrent
+	// transactions can still race before either transaction commits.
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return event, err
@@ -1373,16 +1376,55 @@ func (s *Store) UpsertRunStep(ctx context.Context, step RunStep) error {
 }
 
 func (s *Store) GetRunStep(ctx context.Context, runID, nodeID string) (RunStep, error) {
-	var step RunStep
-	var output string
-	err := s.db.QueryRowContext(ctx, `SELECT run_id, node_id, status, attempt, thread_id, turn_id, output_json, error, started_at, completed_at FROM run_steps WHERE run_id = ? AND node_id = ?`, runID, nodeID).Scan(&step.RunID, &step.NodeID, &step.Status, &step.Attempt, &step.ThreadID, &step.TurnID, &output, &step.Error, &step.StartedAt, &step.CompletedAt)
+	return scanRunStep(s.db.QueryRowContext(ctx, `SELECT run_id, node_id, status, attempt, thread_id, turn_id, output_json, error, started_at, completed_at FROM run_steps WHERE run_id = ? AND node_id = ?`, runID, nodeID))
+}
+
+func (s *Store) ListRunSteps(ctx context.Context, runID string) ([]RunStep, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return nil, errors.New("run id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, node_id, status, attempt, thread_id, turn_id, output_json, error, started_at, completed_at FROM run_steps WHERE run_id = ? ORDER BY started_at ASC, node_id ASC`, runID)
 	if err != nil {
-		return step, err
+		return nil, err
 	}
-	if err := json.Unmarshal([]byte(output), &step.Output); err != nil {
-		return step, err
+	defer rows.Close()
+	steps := make([]RunStep, 0)
+	for rows.Next() {
+		step, err := scanRunStep(rows)
+		if err != nil {
+			return nil, err
+		}
+		steps = append(steps, step)
 	}
-	return step, nil
+	return steps, rows.Err()
+}
+
+// FindRunStepByThread locates the persisted checkpoint associated with a
+// Codex request. App Server permission requests contain a thread/turn rather
+// than a Centurion agent ID, so this bridge lets the approval policy resolve
+// the owning agent without storing request payloads or credentials.
+func (s *Store) FindRunStepByThread(ctx context.Context, threadID, turnID string) (RunStep, error) {
+	threadID = strings.TrimSpace(threadID)
+	turnID = strings.TrimSpace(turnID)
+	if threadID == "" && turnID == "" {
+		return RunStep{}, errors.New("thread or turn id is required")
+	}
+	query := `SELECT run_id, node_id, status, attempt, thread_id, turn_id, output_json, error, started_at, completed_at FROM run_steps WHERE `
+	args := make([]any, 0, 2)
+	switch {
+	case threadID != "" && turnID != "":
+		query += `(thread_id = ? OR turn_id = ?)`
+		args = append(args, threadID, turnID)
+	case threadID != "":
+		query += `thread_id = ?`
+		args = append(args, threadID)
+	default:
+		query += `turn_id = ?`
+		args = append(args, turnID)
+	}
+	query += ` ORDER BY started_at DESC LIMIT 1`
+	return scanRunStep(s.db.QueryRowContext(ctx, query, args...))
 }
 
 func (s *Store) SaveSchedule(ctx context.Context, schedule model.Schedule) error {
@@ -1631,17 +1673,31 @@ func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition str
 func scanAgent(scanner interface{ Scan(...any) error }) (model.AgentProfile, error) {
 	var agent model.AgentProfile
 	var roots, tools string
-	err := scanner.Scan(&agent.ID, &agent.ProjectID, &agent.Name, &agent.Role, &agent.Instructions, &agent.ModelID, &agent.ReasoningEffort, &roots, &tools, &agent.ApprovalProfile, &agent.RoomID, &agent.AvatarID, &agent.VisualState, &agent.MaxDurationSeconds, &agent.MaxTurns, &agent.MaxAttempts, &agent.MemorySummary, &agent.CreatedAt, &agent.UpdatedAt)
+	err := scanner.Scan(&agent.ID, &agent.ProjectID, &agent.Name, &agent.Role, &agent.Instructions, &agent.ModelID, &agent.ReasoningEffort, &roots, &tools, &agent.ApprovalProfile, &agent.RoomID, &agent.AvatarID, &agent.SpriteID, &agent.VisualState, &agent.MaxDurationSeconds, &agent.MaxTurns, &agent.MaxAttempts, &agent.MemorySummary, &agent.CreatedAt, &agent.UpdatedAt)
 	if err != nil {
 		return agent, err
 	}
-	if err := json.Unmarshal([]byte(roots), &agent.WorkspaceRoots); err != nil {
+	agent.WorkspaceRoots, err = decodeAgentList(roots)
+	if err != nil {
 		return agent, err
 	}
-	if err := json.Unmarshal([]byte(tools), &agent.ToolAllowlist); err != nil {
+	agent.ToolAllowlist, err = decodeAgentList(tools)
+	if err != nil {
 		return agent, err
 	}
 	return agent, nil
+}
+
+func scanRunStep(scanner interface{ Scan(...any) error }) (RunStep, error) {
+	var step RunStep
+	var output string
+	if err := scanner.Scan(&step.RunID, &step.NodeID, &step.Status, &step.Attempt, &step.ThreadID, &step.TurnID, &output, &step.Error, &step.StartedAt, &step.CompletedAt); err != nil {
+		return step, err
+	}
+	if err := json.Unmarshal([]byte(output), &step.Output); err != nil {
+		return step, err
+	}
+	return step, nil
 }
 
 func scanRun(scanner interface{ Scan(...any) error }) (model.Run, error) {
@@ -1674,6 +1730,28 @@ func jsonString(value any) (string, error) {
 		return "", err
 	}
 	return string(encoded), nil
+}
+
+func agentListJSON(value []string) (string, error) {
+	if value == nil {
+		value = []string{}
+	}
+	return jsonString(value)
+}
+
+func decodeAgentList(raw string) ([]string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
+		return []string{}, nil
+	}
+	var value []string
+	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+		return nil, err
+	}
+	if value == nil {
+		value = []string{}
+	}
+	return value, nil
 }
 
 func redactedJSON(value any) (string, error) {

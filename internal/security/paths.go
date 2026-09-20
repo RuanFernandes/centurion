@@ -120,6 +120,22 @@ func SandboxPolicy(roots []string, networkAccess bool) map[string]any {
 	return policy
 }
 
+// ReadOnlySandboxPolicy prevents profile-level read-only agents from carrying
+// a previous workspace-write policy into a resumed App Server thread. When
+// roots are known, read access is limited to those roots as well.
+func ReadOnlySandboxPolicy(roots []string) map[string]any {
+	policy := map[string]any{"type": "readOnly"}
+	if len(roots) == 0 {
+		return policy
+	}
+	policy["access"] = map[string]any{
+		"type":                    "restricted",
+		"includePlatformDefaults": true,
+		"readableRoots":           append([]string(nil), roots...),
+	}
+	return policy
+}
+
 func ApprovalPolicy(profile string) string {
 	switch strings.ToLower(strings.TrimSpace(profile)) {
 	case "never", "autonomous":

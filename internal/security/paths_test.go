@@ -61,3 +61,18 @@ func TestApprovalPolicyUsesCurrentAppServerVariants(t *testing.T) {
 		}
 	}
 }
+
+func TestReadOnlySandboxPolicyRestrictsKnownRoots(t *testing.T) {
+	policy := ReadOnlySandboxPolicy([]string{"C:\\workspace"})
+	if policy["type"] != "readOnly" {
+		t.Fatalf("unexpected sandbox type: %#v", policy)
+	}
+	access, ok := policy["access"].(map[string]any)
+	if !ok || access["type"] != "restricted" {
+		t.Fatalf("missing restricted read access: %#v", policy)
+	}
+	roots, ok := access["readableRoots"].([]string)
+	if !ok || len(roots) != 1 || roots[0] != "C:\\workspace" {
+		t.Fatalf("unexpected readable roots: %#v", access)
+	}
+}

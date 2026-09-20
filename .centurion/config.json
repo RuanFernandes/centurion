@@ -1,0 +1,243 @@
+{
+  "schemaVersion": 1,
+  "projectID": "project-local",
+  "folders": [
+    "C:\\Users\\RuanF\\Desktop\\Centurion\\Centurion"
+  ],
+  "updatedAt": "2026-08-27T19:38:20.2631519Z",
+  "agents": [
+    {
+      "id": "agent-architect",
+      "projectID": "project-local",
+      "name": "Mara",
+      "role": "Systems architect",
+      "instructions": "Define a small, safe, and verifiable approach. Return decisions and risks in an objective format.",
+      "modelID": "",
+      "reasoningEffort": "",
+      "workspaceRoots": [
+        "C:\\Users\\RuanF\\Desktop\\Centurion\\Centurion"
+      ],
+      "toolAllowlist": [
+        "files.read",
+        "git.diff"
+      ],
+      "approvalProfile": "on_request",
+      "roomID": "strategy",
+      "avatarID": "architect",
+      "spriteID": "sprite-0",
+      "visualState": "idle",
+      "maxDurationSeconds": 1200,
+      "maxTurns": 8,
+      "maxAttempts": 2,
+      "memorySummary": "",
+      "createdAt": "2026-08-27T19:38:20.2576407Z",
+      "updatedAt": "2026-08-27T19:38:20.2576407Z"
+    },
+    {
+      "id": "agent-builder",
+      "projectID": "project-local",
+      "name": "Nico",
+      "role": "Software implementer",
+      "instructions": "Implement only inside the allowed workspace. Validate changes with tests and report any blocker.",
+      "modelID": "",
+      "reasoningEffort": "",
+      "workspaceRoots": [
+        "C:\\Users\\RuanF\\Desktop\\Centurion\\Centurion"
+      ],
+      "toolAllowlist": [
+        "files.read",
+        "files.write",
+        "shell.test",
+        "git.diff"
+      ],
+      "approvalProfile": "on_request",
+      "roomID": "workshop",
+      "avatarID": "builder",
+      "spriteID": "sprite-2",
+      "visualState": "idle",
+      "maxDurationSeconds": 1800,
+      "maxTurns": 12,
+      "maxAttempts": 2,
+      "memorySummary": "",
+      "createdAt": "2026-08-27T19:38:20.2576407Z",
+      "updatedAt": "2026-08-27T19:38:20.2576407Z"
+    }
+  ],
+  "workflows": [
+    {
+      "id": "workflow-studio-brief",
+      "projectID": "project-local",
+      "name": "Product brief",
+      "version": 1,
+      "description": "Supervisor example with parallel execution, a condition, a bounded loop, and approval.",
+      "entryNodeID": "brief",
+      "nodes": [
+        {
+          "id": "brief",
+          "type": "agent",
+          "label": "Define direction",
+          "agentID": "agent-architect",
+          "timeoutSeconds": 600,
+          "retry": {
+            "maxAttempts": 2,
+            "backoffSeconds": 2,
+            "idempotent": true
+          }
+        },
+        {
+          "id": "parallel",
+          "type": "parallel",
+          "label": "Open workstreams",
+          "retry": {
+            "maxAttempts": 1,
+            "backoffSeconds": 0,
+            "idempotent": false
+          }
+        },
+        {
+          "id": "build",
+          "type": "agent",
+          "label": "Build",
+          "agentID": "agent-builder",
+          "timeoutSeconds": 900,
+          "retry": {
+            "maxAttempts": 2,
+            "backoffSeconds": 4,
+            "idempotent": false
+          }
+        },
+        {
+          "id": "review",
+          "type": "agent",
+          "label": "Review",
+          "agentID": "agent-architect",
+          "timeoutSeconds": 600,
+          "retry": {
+            "maxAttempts": 2,
+            "backoffSeconds": 3,
+            "idempotent": true
+          }
+        },
+        {
+          "id": "join",
+          "type": "join",
+          "label": "Consolidate",
+          "retry": {
+            "maxAttempts": 1,
+            "backoffSeconds": 0,
+            "idempotent": false
+          }
+        },
+        {
+          "id": "quality",
+          "type": "condition",
+          "label": "Quality approved",
+          "condition": "truthy:review.approved",
+          "retry": {
+            "maxAttempts": 1,
+            "backoffSeconds": 0,
+            "idempotent": false
+          }
+        },
+        {
+          "id": "loop",
+          "type": "loop",
+          "label": "Iterate corrections",
+          "maxIterations": 2,
+          "retry": {
+            "maxAttempts": 1,
+            "backoffSeconds": 0,
+            "idempotent": false
+          },
+          "config": {
+            "onExhausted": "approval"
+          }
+        },
+        {
+          "id": "approval",
+          "type": "approval",
+          "label": "Approve publication",
+          "retry": {
+            "maxAttempts": 1,
+            "backoffSeconds": 0,
+            "idempotent": false
+          }
+        },
+        {
+          "id": "artifact",
+          "type": "artifact",
+          "label": "Record result",
+          "retry": {
+            "maxAttempts": 1,
+            "backoffSeconds": 0,
+            "idempotent": false
+          }
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "from": "brief",
+          "to": "parallel"
+        },
+        {
+          "id": "e2",
+          "from": "parallel",
+          "to": "build"
+        },
+        {
+          "id": "e3",
+          "from": "parallel",
+          "to": "review"
+        },
+        {
+          "id": "e4",
+          "from": "build",
+          "to": "join"
+        },
+        {
+          "id": "e5",
+          "from": "review",
+          "to": "join"
+        },
+        {
+          "id": "e6",
+          "from": "join",
+          "to": "quality"
+        },
+        {
+          "id": "e7",
+          "from": "quality",
+          "to": "loop",
+          "condition": "equals:review.approved:false"
+        },
+        {
+          "id": "e8",
+          "from": "quality",
+          "to": "approval",
+          "condition": "equals:review.approved:true"
+        },
+        {
+          "id": "e9",
+          "from": "loop",
+          "to": "quality"
+        },
+        {
+          "id": "e10",
+          "from": "approval",
+          "to": "artifact"
+        }
+      ],
+      "globalLimits": {
+        "maxDurationSeconds": 3600,
+        "maxParallel": 2,
+        "maxTurns": 24,
+        "maxPromptTokens": 12000
+      },
+      "errorPolicy": "stop",
+      "createdAt": "2026-08-27T19:38:20.2576407Z",
+      "updatedAt": "2026-08-27T19:38:20.2576407Z"
+    }
+  ],
+  "schedules": []
+}

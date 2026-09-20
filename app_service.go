@@ -39,8 +39,11 @@ type AppService struct {
 	monitorCancel  context.CancelFunc
 	builderMu      sync.Mutex
 	builderBusy    bool
+	builderStatus  model.BuilderStatus
 	builderThreads map[string]time.Time
 	plannerThreads map[string]time.Time
+	learningMu     sync.Mutex
+	learningBusy   bool
 }
 
 type pendingApproval struct {
@@ -49,6 +52,15 @@ type pendingApproval struct {
 	serverID     []byte
 	serverParams map[string]any
 	serverMethod string
+}
+
+var agentSpriteIDs = []string{"sprite-0", "sprite-1", "sprite-2", "sprite-3", "sprite-4", "sprite-5", "sprite-6", "sprite-7"}
+
+func newAgentSpriteID() string {
+	if len(agentSpriteIDs) == 0 {
+		return "sprite-0"
+	}
+	return agentSpriteIDs[int(uuid.New()[0])%len(agentSpriteIDs)]
 }
 
 func NewAppService(dataStore *store.Store) *AppService {
@@ -113,6 +125,9 @@ func (s *AppService) Close() {
 	s.connectMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if s.executor != nil {
+		s.executor.Close()
 	}
 	_ = s.codex.Stop()
 }
@@ -258,6 +273,9 @@ func (s *AppService) CreateAgent(profile model.AgentProfile) (model.AgentProfile
 	if profile.ID == "" {
 		profile.ID = uuid.NewString()
 	}
+	if strings.TrimSpace(profile.SpriteID) == "" {
+		profile.SpriteID = newAgentSpriteID()
+	}
 	if profile.VisualState == "" {
 		profile.VisualState = model.AgentStateIdle
 	}
@@ -321,6 +339,13 @@ func (s *AppService) UpdateAgent(profile model.AgentProfile) (model.AgentProfile
 	}
 	ctx, cancel := operationContext()
 	defer cancel()
+	if strings.TrimSpace(profile.SpriteID) == "" {
+		if existing, err := s.store.GetAgent(ctx, profile.ID); err == nil && strings.TrimSpace(existing.SpriteID) != "" {
+			profile.SpriteID = existing.SpriteID
+		} else {
+			profile.SpriteID = newAgentSpriteID()
+		}
+	}
 	if profile.ProjectID == "" {
 		if existing, err := s.store.GetAgent(ctx, profile.ID); err == nil {
 			profile.ProjectID = existing.ProjectID
@@ -369,6 +394,9 @@ func (s *AppService) SaveWorkflow(definition model.WorkflowDefinition) (model.Wo
 		if active, err := s.store.GetActiveProject(ctx); err == nil {
 			definition.ProjectID = active.ID
 		}
+	}
+	if err := s.validateWorkflowAgents(ctx, definition); err != nil {
+		return model.WorkflowDefinition{}, err
 	}
 	if err := s.store.SaveWorkflow(ctx, definition); err != nil {
 		return model.WorkflowDefinition{}, err
@@ -671,6 +699,9 @@ func (s *AppService) StartRun(workflowID string, input map[string]any) (model.Ru
 			return model.Run{}, errors.New("workflow belongs to a different project")
 		}
 	}
+	if err := s.validateWorkflowAgents(ctx, workflow); err != nil {
+		return model.Run{}, err
+	}
 	run, err := s.executor.Start(ctx, workflow, input, project)
 	if err == nil {
 		encodedInput, _ := json.Marshal(input)
@@ -816,6 +847,12 @@ func (s *AppService) GetRunEvents(runID string, afterSequence int64) ([]model.Ru
 	return s.executor.Events(ctx, runID, afterSequence)
 }
 
+func (s *AppService) GetRunSteps(runID string) ([]model.RunStep, error) {
+	ctx, cancel := operationContext()
+	defer cancel()
+	return s.store.ListRunSteps(ctx, runID)
+}
+
 func (s *AppService) ResolveApproval(decision model.ApprovalDecision) error {
 	if strings.TrimSpace(decision.ID) == "" {
 		return errors.New("approval id is required")
@@ -938,6 +975,11 @@ func (s *AppService) ensureConnected() error {
 }
 
 func (s *AppService) requestApproval(ctx context.Context, request model.ApprovalRequest) (bool, error) {
+	if s.shouldAutoApproveRun(ctx, request.RunID) {
+		s.appendApprovalAudit(request, "auto_approved", "policy")
+		s.emit("approval.resolved", model.ApprovalDecision{ID: request.ID, Decision: "approve"})
+		return true, nil
+	}
 	response := make(chan bool, 1)
 	s.mu.Lock()
 	s.approvals[request.ID] = &pendingApproval{request: request, response: response}
@@ -959,6 +1001,87 @@ func (s *AppService) requestApproval(ctx context.Context, request model.Approval
 		s.emit("approval.resolved", model.ApprovalDecision{ID: request.ID, Decision: "timeout"})
 		s.appendApprovalAudit(request, "timeout", "system")
 		return false, ctx.Err()
+	}
+}
+
+// shouldAutoApproveRun applies the user's Full access choice to workflow-level
+// gates as well as Codex tool permission requests. An autonomous workflow is
+// only eligible when every agent node in it is explicitly autonomous; a mixed
+// workflow keeps the approval UI for the non-autonomous path.
+func (s *AppService) shouldAutoApproveRun(ctx context.Context, runID string) bool {
+	if strings.TrimSpace(runID) == "" || s.store == nil {
+		return false
+	}
+	run, err := s.store.GetRun(ctx, runID)
+	if err != nil {
+		return false
+	}
+	workflow, err := s.store.GetWorkflow(ctx, run.WorkflowID)
+	if err != nil {
+		return false
+	}
+	seenAgent := false
+	for _, node := range workflow.Nodes {
+		if node.Type != "agent" || strings.TrimSpace(node.AgentID) == "" {
+			continue
+		}
+		seenAgent = true
+		agent, agentErr := s.store.GetAgent(ctx, node.AgentID)
+		if agentErr != nil || !isAutonomousApprovalProfile(agent.ApprovalProfile) {
+			return false
+		}
+	}
+	return seenAgent
+}
+
+func (s *AppService) shouldAutoApproveServerRequest(method string, params map[string]any) bool {
+	switch method {
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval":
+	default:
+		return false
+	}
+	if s.store == nil {
+		return false
+	}
+	threadID := stringValue(params["threadId"])
+	if s.codex != nil {
+		if agentID, ok := s.codex.AgentForThread(threadID); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			agent, err := s.store.GetAgent(ctx, agentID)
+			return err == nil && isAutonomousApprovalProfile(agent.ApprovalProfile)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	step, err := s.store.FindRunStepByThread(ctx, threadID, stringValue(params["turnId"]))
+	if err != nil {
+		return false
+	}
+	run, err := s.store.GetRun(ctx, step.RunID)
+	if err != nil {
+		return false
+	}
+	workflow, err := s.store.GetWorkflow(ctx, run.WorkflowID)
+	if err != nil {
+		return false
+	}
+	for _, node := range workflow.Nodes {
+		if node.ID != step.NodeID || node.Type != "agent" {
+			continue
+		}
+		agent, agentErr := s.store.GetAgent(ctx, node.AgentID)
+		return agentErr == nil && isAutonomousApprovalProfile(agent.ApprovalProfile)
+	}
+	return false
+}
+
+func isAutonomousApprovalProfile(profile string) bool {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "autonomous", "never", "full", "full_access", "full access":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1018,8 +1141,28 @@ func (s *AppService) handleServerRequest(request codex.ServerRequest) {
 		title = "Codex needs a response"
 	}
 	requestModel := model.ApprovalRequest{SchemaVersion: 1, Timestamp: now(), ID: id, Kind: kind, Title: title, Detail: detail, ThreadID: stringValue(params["threadId"]), TurnID: stringValue(params["turnId"]), ItemID: stringValue(params["itemId"]), Choices: []string{"accept", "decline"}}
+	pending := &pendingApproval{request: requestModel, serverID: append([]byte(nil), request.ID...), serverParams: params, serverMethod: request.Method}
+	if s.shouldAutoApproveServerRequest(request.Method, params) {
+		approvalContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// The App Server protocol uses "accept" for command and file-change
+		// approvals. "approve" is only Centurion's UI vocabulary for workflow
+		// approvals and is not a valid server-request decision.
+		response := serverApprovalResponse(pending, "accept")
+		respondErr := error(nil)
+		if response == nil {
+			respondErr = errors.New("server request does not support automatic approval")
+		} else {
+			respondErr = s.codexRespond(approvalContext, request.ID, response)
+		}
+		cancel()
+		if respondErr == nil {
+			s.appendApprovalAudit(requestModel, "auto_approved", "policy")
+			s.emit("approval.resolved", model.ApprovalDecision{ID: id, Decision: "approve"})
+			return
+		}
+	}
 	s.mu.Lock()
-	s.approvals[id] = &pendingApproval{request: requestModel, serverID: append([]byte(nil), request.ID...), serverParams: params, serverMethod: request.Method}
+	s.approvals[id] = pending
 	s.mu.Unlock()
 	s.appendApprovalAudit(requestModel, "requested", "codex")
 	s.emit("approval.requested", requestModel)
@@ -1152,6 +1295,32 @@ func projectForID(ctx context.Context, dataStore *store.Store, projectID string)
 	return dataStore.GetProject(ctx, strings.TrimSpace(projectID))
 }
 
+func (s *AppService) validateWorkflowAgents(ctx context.Context, workflow model.WorkflowDefinition) error {
+	projectID := strings.TrimSpace(workflow.ProjectID)
+	agents, err := s.store.ListAgentsForProject(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("load workflow agents: %w", err)
+	}
+	available := make(map[string]model.AgentProfile, len(agents))
+	for _, agent := range agents {
+		available[agent.ID] = agent
+	}
+	for _, node := range workflow.Nodes {
+		if node.Type != "agent" {
+			continue
+		}
+		agentID := strings.TrimSpace(node.AgentID)
+		agent, ok := available[agentID]
+		if !ok {
+			return fmt.Errorf("workflow node %q references unknown agent %q", node.ID, agentID)
+		}
+		if projectID != "" && agent.ProjectID != "" && agent.ProjectID != projectID {
+			return fmt.Errorf("workflow node %q references agent %q from another project", node.ID, agentID)
+		}
+	}
+	return nil
+}
+
 type cappedBuffer struct {
 	bytes.Buffer
 	limit     int
@@ -1190,7 +1359,11 @@ func serverApprovalResponse(pending *pendingApproval, decision string) map[strin
 	}
 	switch pending.serverMethod {
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
-		return map[string]any{"decision": decision}
+		serverDecision := "decline"
+		if decision == "accept" || decision == "approve" {
+			serverDecision = "accept"
+		}
+		return map[string]any{"decision": serverDecision}
 	case "item/permissions/requestApproval":
 		if decision != "accept" && decision != "approve" {
 			return map[string]any{"permissions": []any{}, "scope": "turn"}

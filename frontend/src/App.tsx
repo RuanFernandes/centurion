@@ -2,18 +2,21 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Events, Window as WailsWindow } from '@wailsio/runtime'
 import { api } from './api'
 import type {
-	AgentProfile,
+  AgentProfile,
 	AuditEntry,
   ApprovalRequest,
   AuthState,
+  BuilderActivityEvent,
   BuilderApplyResult,
   BuilderProposal,
+  BuilderStatus,
   HistoryEntry,
   MCPServer,
   ModelInfo,
   Project,
 	Run,
 	RunEvent,
+	RunStep,
 	RuntimeStatus,
   Schedule,
   SystemPrompt,
@@ -22,7 +25,7 @@ import type {
   WorkflowNode,
   WorkflowValidation,
 } from './types'
-import { defaultAgent, defaultProject } from './types'
+import { defaultAgent, defaultProject, normalizeAgent } from './types'
 import './styles.css'
 
 type View = 'projects' | 'office' | 'workflows' | 'builder' | 'agents' | 'runs' | 'terminal' | 'history' | 'schedules' | 'mcp' | 'settings'
@@ -58,6 +61,7 @@ const runLabels: Record<string, string> = {
   paused: 'Paused',
   waiting_approval: 'Waiting for approval',
   completed: 'Completed',
+  blocked: 'Blocked',
   failed: 'Failed',
   canceled: 'Canceled',
   interrupted: 'Interrupted',
@@ -73,6 +77,19 @@ function errorText(error: unknown): string {
   if (typeof error === 'string') return error
   if (error && typeof error === 'object' && 'message' in error) return String(error.message)
   return 'Could not complete the operation.'
+}
+
+function mergeRunSnapshot(current: Run[], incoming: Run): Run[] {
+  const index = current.findIndex((run) => run.id === incoming.id)
+  if (index < 0) return [incoming, ...current]
+  const existing = current[index]
+  const existingTime = Date.parse(existing.updatedAt)
+  const incomingTime = Date.parse(incoming.updatedAt)
+  if (existing.status !== 'queued' && incoming.status === 'queued') return current
+  if (Number.isFinite(existingTime) && Number.isFinite(incomingTime) && existingTime > incomingTime) return current
+  const next = [...current]
+  next[index] = incoming
+  return next
 }
 
 async function copyToClipboard(value: string): Promise<boolean> {
@@ -175,6 +192,94 @@ function statusLabel(value: string): string {
   return runLabels[value] ?? value.split('_').join(' ')
 }
 
+function runTone(value: string): string {
+  switch (value) {
+    case 'completed':
+      return 'success'
+    case 'failed':
+      return 'danger'
+    case 'blocked':
+      return 'warning'
+    case 'running':
+      return 'accent'
+    default:
+      return 'neutral'
+  }
+}
+
+function readableLabel(value: string): string {
+  return value
+    .replace(/^_+/, '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\w/, (character) => character.toUpperCase())
+}
+
+function parseJSONText(value: string, allowEmbedded = false): unknown | undefined {
+  const trimmed = value.trim()
+  const candidates = [trimmed]
+  if (allowEmbedded && !trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    const start = trimmed.indexOf('{')
+    const end = trimmed.lastIndexOf('}')
+    if (start >= 0 && end > start) candidates.push(trimmed.slice(start, end + 1))
+  }
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as unknown
+    } catch {
+      // Keep normal prose and Markdown untouched.
+    }
+  }
+  return undefined
+}
+
+function readableValue(value: unknown): string {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value).trim()
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      const text = readableValue(item)
+      return text ? `• ${text.replace(/\n/g, '\n  ')}` : ''
+    }).filter(Boolean).join('\n')
+  }
+  if (typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>).map(([key, item]) => {
+      const text = readableValue(item)
+      return text ? `${readableLabel(key)}: ${text.replace(/\n/g, '\n  ')}` : ''
+    }).filter(Boolean).join('\n')
+  }
+  return ''
+}
+
+function readableStructuredOutput(output: Record<string, unknown>): string {
+  const primary = ['text', 'summary', 'message'].map((key) => output[key]).find((value): value is string => typeof value === 'string' && value.trim() !== '')
+  if (primary) return readableUserText(primary).trim()
+
+  const sections: string[] = []
+  for (const key of ['result', 'decision', 'nextStep', 'reason']) {
+    const text = readableValue(output[key])
+    if (text) sections.push(`${readableLabel(key)}: ${text}`)
+  }
+  for (const key of ['blockers', 'changedPaths', 'files', 'artifacts', 'evidence']) {
+    const text = readableValue(output[key])
+    if (text) sections.push(`${readableLabel(key)}:\n${text}`)
+  }
+  if (sections.length > 0) return sections.join('\n\n').trim()
+
+  if (typeof output.status === 'string' && output.status.trim() !== '') return `Status: ${statusLabel(output.status)}`
+  if (typeof output._rawText === 'string' && output._rawText.trim() !== '') return readableUserText(output._rawText, true).trim()
+  return readableValue(output).trim()
+}
+
+function readableUserText(value: string, allowEmbedded = false): string {
+  const parsed = parseJSONText(value, allowEmbedded)
+  if (parsed === undefined) return value
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return readableStructuredOutput(parsed as Record<string, unknown>)
+  return readableValue(parsed)
+}
+
 function Icon({ glyph }: { glyph: string }) {
   const common = { viewBox: '0 0 24 24', width: 16, height: 16, fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const }
   const icon = glyph === 'P' ? <><path d="M6 20V4h7a4 4 0 0 1 0 8H6" /><path d="M10 16h8" /></>
@@ -274,12 +379,16 @@ function MCPCard({ server, onLogin }: { server: MCPServer; onLogin: (server: MCP
 }
 
 function AgentAvatar({ agent, compact = false }: { agent: AgentProfile; compact?: boolean }) {
-  const initials = agent.name.trim().split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'AG'
+  const name = typeof agent.name === 'string' && agent.name.trim() ? agent.name : 'Agent'
+  const initials = name.trim().split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'AG'
   const state = agent.visualState || 'idle'
+  const spriteValue = /^sprite-(\d+)$/.exec(agent.spriteID ?? '')
+  const spriteSeed = agent.id || agent.avatarID || agent.name
+  const spriteIndex = spriteValue ? Number(spriteValue[1]) % 8 : [...spriteSeed].reduce((hash, character) => (hash * 31 + character.charCodeAt(0)) >>> 0, 7) % 8
   return (
-    <div className={`agent-avatar ${compact ? 'compact' : ''} state-${state}`} aria-label={`${agent.name}: ${stateLabels[state] ?? state}`}>
+    <div className={`agent-avatar ${compact ? 'compact' : ''} state-${state}`} aria-label={`${name}: ${stateLabels[state] ?? state}`}>
       <div className="avatar-aura" />
-      <div className="avatar-body"><span>{initials}</span></div>
+      <div className={`avatar-sprite sprite-${spriteIndex}`} role="img" aria-label={`${name} avatar`}><span className="avatar-fallback-initials">{initials}</span></div>
       <div className="avatar-status" aria-hidden="true"><span /></div>
     </div>
   )
@@ -291,6 +400,19 @@ const agentPresets = [
   { id: 'researcher', label: 'Researcher', detail: 'Finds context and summarizes evidence.', role: 'Researcher', instructions: 'Collect relevant context, separate facts from assumptions, and return a concise synthesis with sources or next steps.', tools: ['files.read', 'web.search'], room: 'library', avatar: 'researcher' },
   { id: 'reviewer', label: 'Reviewer', detail: 'Looks for issues before delivery.', role: 'Quality reviewer', instructions: 'Review the result for bugs, security risks, and missing tests. Be specific and prioritize findings.', tools: ['files.read', 'git.diff', 'shell.test'], room: 'strategy', avatar: 'reviewer' },
 ] as const
+
+function inferAgentPreset(agent: AgentProfile): typeof agentPresets[number]['id'] {
+  const role = `${agent.role ?? ''} ${agent.name ?? ''}`.toLowerCase()
+  const instructions = (agent.instructions ?? '').toLowerCase()
+  const avatar = (agent.avatarID ?? '').toLowerCase()
+  const text = `${role} ${instructions}`
+
+  if (/research|researcher|analys|evidence|discover|investigat|market/.test(text)) return 'researcher'
+  if (/review|reviewer|quality|qa\b|audit|security|test/.test(text)) return 'reviewer'
+  if (/supervis|tech lead|team lead|architect|orchestrat|coordinate|planner/.test(text)) return 'supervisor'
+  if (avatar === 'supervisor' || avatar === 'researcher' || avatar === 'reviewer' || avatar === 'builder') return avatar
+  return 'builder'
+}
 
 const permissionOptions = [
   { id: 'files.read', label: 'Read files', detail: 'Inspect files inside the allowed workspace.' },
@@ -314,19 +436,20 @@ const workflowNodeMeta: Record<string, { label: string; mark: string; detail: st
 const workflowBlockTypes = Object.entries(workflowNodeMeta).map(([type, meta]) => ({ type, ...meta }))
 
 function PermissionPicker({ value, onChange }: { value: string[]; onChange: (value: string[]) => void }) {
+  const selectedPermissions = Array.isArray(value) ? value : []
   const knownPermissions = new Set<string>(permissionOptions.map((permission) => permission.id))
-  const customPermissions = value.filter((permission) => !knownPermissions.has(permission))
+  const customPermissions = selectedPermissions.filter((permission) => !knownPermissions.has(permission))
   const toggle = (permissionID: string) => {
-    const next = new Set(value)
+    const next = new Set(selectedPermissions)
     if (next.has(permissionID)) next.delete(permissionID)
     else next.add(permissionID)
     onChange([...next])
   }
   const renderOption = (permissionID: string, label: string, detail: string) => {
-    const selected = value.includes(permissionID)
+    const selected = selectedPermissions.includes(permissionID)
     return <label className={`permission-option ${selected ? 'selected' : ''}`} key={permissionID}><input type="checkbox" checked={selected} onChange={() => toggle(permissionID)} /><span className="permission-mark" aria-hidden="true">✓</span><span className="permission-copy"><strong>{label}</strong><small>{detail}</small></span></label>
   }
-  return <div className="permission-picker"><div className="permission-list" role="group" aria-label="Agent tools and permissions">{permissionOptions.map((permission) => renderOption(permission.id, permission.label, permission.detail))}{customPermissions.map((permission) => renderOption(permission, permission, 'Custom permission preserved from this agent.'))}</div><span className="field-hint">{value.length} {value.length === 1 ? 'permission' : 'permissions'} selected</span></div>
+  return <div className="permission-picker"><div className="permission-list" role="group" aria-label="Agent tools and permissions">{permissionOptions.map((permission) => renderOption(permission.id, permission.label, permission.detail))}{customPermissions.map((permission) => renderOption(permission, permission, 'Custom permission preserved from this agent.'))}</div><span className="field-hint">{selectedPermissions.length} {selectedPermissions.length === 1 ? 'permission' : 'permissions'} selected</span></div>
 }
 
 function AgentEditor({
@@ -344,9 +467,11 @@ function AgentEditor({
   onDelete?: () => void
   busy: boolean
 }) {
-  const [presetID, setPresetID] = useState('builder')
+  const [presetID, setPresetID] = useState(() => inferAgentPreset(agent))
   const selectedModel = models.find((model) => model.id === agent.modelID)
   const efforts = selectedModel?.supportedReasoningEfforts ?? []
+  const workspaceRoots = Array.isArray(agent.workspaceRoots) ? agent.workspaceRoots : []
+  const toolAllowlist = Array.isArray(agent.toolAllowlist) ? agent.toolAllowlist : []
   const update = <K extends keyof AgentProfile>(key: K, value: AgentProfile[K]) => onChange({ ...agent, [key]: value })
   const accessMode = agent.approvalProfile === 'autonomous' || agent.approvalProfile === 'trusted' ? 'complete' : 'approval'
   const applyPreset = (preset: typeof agentPresets[number]) => {
@@ -363,7 +488,7 @@ function AgentEditor({
       </div>
       <label className="field"><span>Model</span><select value={agent.modelID} onChange={(event) => update('modelID', event.target.value)}><option value="">Default available model</option>{models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label>
       <div><span className="field-heading">Agent access</span><div className="access-picker" role="radiogroup" aria-label="Access level"><button type="button" className={accessMode === 'complete' ? 'active' : ''} onClick={() => update('approvalProfile', 'autonomous')}><strong>Full access</strong><span>Runs inside the workspace without intermediate approval.</span></button><button type="button" className={accessMode === 'approval' ? 'active' : ''} onClick={() => update('approvalProfile', 'on_request')}><strong>Request approval</strong><span>Pauses before commands, file changes, or external effects.</span></button></div></div>
-      <details className="advanced-options"><summary>Advanced options</summary><div className="advanced-body"><label className="field"><span>Instructions</span><textarea rows={4} value={agent.instructions} onChange={(event) => update('instructions', event.target.value)} /></label><label className="field"><span>Allowed workspace</span><textarea rows={2} placeholder="One absolute path per line" value={agent.workspaceRoots.join('\n')} onChange={(event) => update('workspaceRoots', event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean))} /></label><div className="field"><span>Tools & permissions</span><PermissionPicker value={agent.toolAllowlist} onChange={(value) => update('toolAllowlist', value)} /></div><div className="field-grid"><label className="field"><span>Effort</span><select value={agent.reasoningEffort} onChange={(event) => update('reasoningEffort', event.target.value)}><option value="">Automatic</option>{efforts.map((effort) => <option key={effort.reasoningEffort} value={effort.reasoningEffort}>{effort.reasoningEffort}</option>)}</select></label><label className="field compact-field"><span>Max turns</span><input type="number" min={1} value={agent.maxTurns} onChange={(event) => update('maxTurns', Number(event.target.value))} /></label></div></div></details>
+      <details className="advanced-options"><summary>Advanced options</summary><div className="advanced-body"><label className="field"><span>Instructions</span><textarea rows={4} value={agent.instructions} onChange={(event) => update('instructions', event.target.value)} /></label><label className="field"><span>Allowed workspace</span><textarea rows={2} placeholder="One absolute path per line" value={workspaceRoots.join('\n')} onChange={(event) => update('workspaceRoots', event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean))} /></label><div className="field"><span>Tools & permissions</span><PermissionPicker value={toolAllowlist} onChange={(value) => update('toolAllowlist', value)} /></div><div className="field-grid"><label className="field"><span>Effort</span><select value={agent.reasoningEffort} onChange={(event) => update('reasoningEffort', event.target.value)}><option value="">Automatic</option>{efforts.map((effort) => <option key={effort.reasoningEffort} value={effort.reasoningEffort}>{effort.reasoningEffort}</option>)}</select></label><label className="field compact-field"><span>Max turns</span><input type="number" min={1} value={agent.maxTurns} onChange={(event) => update('maxTurns', Number(event.target.value))} /></label></div></div></details>
       <div className="editor-actions"><button className="button primary" onClick={onSave} disabled={busy}>{busy ? 'Saving…' : 'Save agent'}</button>{onDelete && <button className="button danger-quiet" onClick={onDelete} disabled={busy}>Delete agent</button>}</div>
     </div>
   )
@@ -581,6 +706,17 @@ function WorkflowCanvas({
     commitDraft((current) => ({ ...current, edges: [...current.edges, { id: `edge-${Date.now().toString(36)}`, from: connectingFrom, to: nodeID }] }))
     clearConnection()
     onNotice('Connection created.')
+  }
+  const autoConnectWorkflow = () => {
+    const current = draftRef.current
+    if (current.nodes.length < 2 || current.edges.length > 0) return
+    const edges = current.nodes.slice(0, -1).map((node, index) => ({
+      id: `edge-auto-${Date.now().toString(36)}-${index + 1}`,
+      from: node.id,
+      to: current.nodes[index + 1].id,
+    }))
+    commitDraft((value) => ({ ...value, edges }))
+    onNotice('Steps connected in their declared order. Review the route before running.')
   }
   const startConnectionDrag = (event: React.PointerEvent<HTMLButtonElement>, nodeID: string) => {
     if (event.button !== 0) return
@@ -807,7 +943,7 @@ function WorkflowCanvas({
           <button type="button" className="button primary workflow-action" onClick={() => void startWorkflow()} disabled={busy || validating || !draft.nodes.length}><span className="button-symbol" aria-hidden="true">▶</span>Run workflow</button>
         </div>
       </div>
-      <div className={`workflow-validation ${validationTone}`} role="status" aria-live="polite"><span className="workflow-validation-mark" aria-hidden="true">{validationTone === 'valid' ? '✓' : validationTone === 'invalid' ? '!' : '·'}</span><div><strong>{validationTitle}</strong><span>{validationDetail}</span></div><button type="button" className="link-button" onClick={() => void validateDraft()} disabled={validating}>{validating ? 'Checking…' : 'Validate'}</button></div>
+      <div className={`workflow-validation ${validationTone}`} role="status" aria-live="polite"><span className="workflow-validation-mark" aria-hidden="true">{validationTone === 'valid' ? '✓' : validationTone === 'invalid' ? '!' : '·'}</span><div><strong>{validationTitle}</strong><span>{validationDetail}</span></div><div className="workflow-validation-actions">{draft.nodes.length > 1 && draft.edges.length === 0 && <button type="button" className="button subtle small workflow-repair-action" onClick={autoConnectWorkflow}>Connect in order</button>}<button type="button" className="link-button" onClick={() => void validateDraft()} disabled={validating}>{validating ? 'Checking…' : 'Validate'}</button></div></div>
       <div className="canvas-layout">
         <div className="graph-canvas" onPointerMove={moveConnection} onPointerUp={endConnection} onPointerCancel={() => { if (connectionDrag.current) clearConnection(); else stopDrag() }} onKeyDown={handleCanvasKeyDown} role="region" aria-label="Visual workflow canvas. Use Delete to remove the selected step." tabIndex={0}>
           <div className="canvas-toolbar">
@@ -835,7 +971,7 @@ function WorkflowCanvas({
             <div className="inspector-actions"><button type="button" className="button subtle small" onClick={duplicateNode}>Duplicate</button>{selectedNode.id !== draft.entryNodeID && <button type="button" className="link-button" onClick={setEntryNode}>Set as start</button>}<button type="button" className="button danger-quiet small" onClick={removeSelectedNode}>Delete</button></div>
             <label className="field"><span>Name</span><input value={selectedNode.label} onChange={(event) => updateNode({ label: event.target.value })} /></label>
             <label className="field"><span>Type</span><select value={selectedNode.type} onChange={(event) => updateNode({ type: event.target.value })}>{workflowBlockTypes.map((block) => <option key={block.type} value={block.type}>{block.label}</option>)}</select></label>
-            {selectedNode.type === 'agent' && <label className="field"><span>Agent</span><select value={selectedNode.agentID ?? ''} onChange={(event) => updateNode({ agentID: event.target.value })}><option value="">Select an agent</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select>{agents.length === 0 && <small className="field-hint">Create an agent before running this step.</small>}</label>}
+            {selectedNode.type === 'agent' && <><label className="field"><span>Agent</span><select value={selectedNode.agentID ?? ''} onChange={(event) => updateNode({ agentID: event.target.value })}><option value="">Select an agent</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select>{agents.length === 0 && <small className="field-hint">Create an agent before running this step.</small>}</label><label className="field"><span>Task prompt</span><textarea rows={5} value={selectedNode.prompt ?? ''} placeholder="Describe the exact work and expected evidence for this step..." onChange={(event) => updateNode({ prompt: event.target.value })} /><small className="field-hint">This task is sent to the agent at runtime, together with the project brief.</small></label></>}
             {selectedNode.type === 'loop' && <label className="field"><span>Max iterations</span><input type="number" min={1} value={selectedNode.maxIterations ?? 1} onChange={(event) => updateNode({ maxIterations: Number(event.target.value) })} /></label>}
             {selectedNode.type === 'condition' && <label className="field"><span>Condition expression</span><input value={selectedNode.condition ?? ''} placeholder="truthy:review.approved" onChange={(event) => updateNode({ condition: event.target.value })} /></label>}
             {selectedNode.type === 'tool' && <label className="field"><span>Tool name</span><input value={selectedNode.toolName ?? ''} placeholder="server.tool" onChange={(event) => updateNode({ toolName: event.target.value })} /></label>}
@@ -935,6 +1071,8 @@ function ProjectEditor({
   onOpen,
   onDelete,
   onChooseFolder,
+  onLearnSystem,
+  models,
   busy,
 }: {
   project: Project
@@ -943,9 +1081,17 @@ function ProjectEditor({
   onOpen: () => void
   onDelete?: () => void
   onChooseFolder: () => Promise<string | undefined>
+  onLearnSystem: (project: Project, modelID: string, reasoningEffort: string) => Promise<void>
+  models: ModelInfo[]
   busy: boolean
 }) {
   const [selectingFolder, setSelectingFolder] = useState(false)
+  const [learnOpen, setLearnOpen] = useState(false)
+  const [learning, setLearning] = useState(false)
+  const [learnModelID, setLearnModelID] = useState('')
+  const [learnEffort, setLearnEffort] = useState('')
+  const selectedLearnModel = models.find((model) => model.id === learnModelID) ?? models.find((model) => model.isDefault) ?? models[0]
+  const learnEfforts = selectedLearnModel?.supportedReasoningEfforts ?? []
   const update = <K extends keyof Project>(key: K, value: Project[K]) => onChange({ ...project, [key]: value })
   const chooseFolder = async () => {
     if (selectingFolder || busy) return
@@ -960,6 +1106,19 @@ function ProjectEditor({
     }
   }
   const removeFolder = (folder: string) => update('folders', project.folders.filter((item) => item !== folder))
+  const makePrimary = (folder: string) => update('folders', [folder, ...project.folders.filter((item) => item !== folder)])
+  const startLearning = async () => {
+    if (!project.id || project.folders.length === 0 || learning || busy) return
+    setLearning(true)
+    try {
+      await onLearnSystem(project, learnModelID, learnEffort)
+      setLearnOpen(false)
+    } catch {
+      // The parent reports the backend error and keeps the confirmation open.
+    } finally {
+      setLearning(false)
+    }
+  }
 
   return <section className="panel-card project-editor-card">
     <div className="editor-heading"><div><span className="section-kicker">Project workspace</span><h2>{project.id ? project.name : 'New project'}</h2></div><span className="mini-code">{project.id ? project.id.slice(0, 8) : 'draft'}</span></div>
@@ -968,11 +1127,12 @@ function ProjectEditor({
       <label className="field"><span>Name</span><input value={project.name} onChange={(event) => update('name', event.target.value)} placeholder="e.g. Centurion" /></label>
       <label className="field"><span>Description</span><input value={project.description ?? ''} onChange={(event) => update('description', event.target.value)} placeholder="What belongs here?" /></label>
     </div>
-    <div className="field project-folders-field"><span className="field-heading">Project folders</span><span className="field-hint">Agents use these folders as their workspace boundary. The terminal starts in one selected folder.</span>
-      <div className="project-folder-list">{project.folders.map((folder) => <div className="project-folder-row" key={folder}><span className="folder-mark" aria-hidden="true">/</span><code title={folder}>{folder}</code><button type="button" className="icon-button" onClick={() => removeFolder(folder)} aria-label={`Remove ${folder}`}>×</button></div>)}{project.folders.length === 0 && <div className="empty-small"><strong>No folders yet</strong><span>Choose at least one local folder for this project.</span></div>}</div>
+    <div className="field project-folders-field"><span className="field-heading">Project folders</span><span className="field-hint">Agents use these folders as their workspace boundary. The first folder is the primary root, and system documentation is written to its docs/ folder.</span>
+      <div className="project-folder-list">{project.folders.map((folder, index) => <div className={`project-folder-row ${index === 0 ? 'primary' : ''}`} key={folder}><span className="folder-mark" aria-hidden="true">/</span><div className="project-folder-copy"><code title={folder}>{folder}</code>{index === 0 && <span className="folder-primary-badge">Primary folder</span>}</div><div className="project-folder-row-actions">{index > 0 && <button type="button" className="folder-primary-button" onClick={() => makePrimary(folder)} disabled={busy || learning}>Set as primary</button>}<button type="button" className="icon-button" onClick={() => removeFolder(folder)} aria-label={`Remove ${folder}`} disabled={busy || learning}>×</button></div></div>)}{project.folders.length === 0 && <div className="empty-small"><strong>No folders yet</strong><span>Choose at least one local folder for this project.</span></div>}</div>
       <div className="project-folder-add"><div className="project-folder-picker-copy"><span className="folder-picker-icon" aria-hidden="true">+</span><span><strong>Add a workspace folder</strong><small>Choose a folder from Windows Explorer.</small></span></div><button type="button" className="button subtle project-folder-picker-button" onClick={() => void chooseFolder()} disabled={busy || selectingFolder} aria-busy={selectingFolder}>{selectingFolder ? 'Opening…' : 'Choose folder'}</button></div>
     </div>
-    <div className="project-editor-actions"><button type="button" className="button subtle" onClick={onOpen} disabled={!project.id}>Open project</button><div className="project-editor-actions-right">{onDelete && <button type="button" className="button danger-quiet" onClick={onDelete} disabled={busy}>Delete</button>}<button type="button" className="button primary" onClick={onSave} disabled={busy || !project.name.trim() || project.folders.length === 0}>{busy ? 'Saving…' : 'Save project'}</button></div></div>
+    {learnOpen && <div className="learn-confirmation" role="dialog" aria-modal="false" aria-labelledby="learn-system-title" aria-describedby="learn-system-description" aria-busy={learning}><div className="learn-confirmation-heading"><div><span className="section-kicker">Codex documentation</span><h3 id="learn-system-title">Learn this system</h3></div><button type="button" className="link-button" onClick={() => setLearnOpen(false)} disabled={learning}>Close</button></div><p id="learn-system-description">Centurion will inspect every configured folder and create a factual documentation set in the primary project folder.</p><div className="learn-token-warning"><strong>Token-intensive operation</strong><span>This can consume a lot of tokens on large repositories. Dependencies, generated output, binaries, caches, and secrets are skipped to keep the pass focused.</span></div><div className="field-grid"><label className="field"><span>Model</span><select value={learnModelID} onChange={(event) => { setLearnModelID(event.target.value); setLearnEffort('') }} disabled={learning || busy}><option value="">Account default</option>{models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label><label className="field"><span>Thinking effort</span><select value={learnEffort} onChange={(event) => setLearnEffort(event.target.value)} disabled={learning || busy || learnEfforts.length === 0}><option value="">Automatic, economy first</option>{learnEfforts.map((effort) => <option key={effort.reasoningEffort} value={effort.reasoningEffort}>{effort.reasoningEffort}</option>)}</select></label></div><div className="learn-output-note"><span>Output</span><code>docs/centurion-*.md</code><small>Only the generated documentation files inside the primary folder are requested.</small></div><div className="learn-confirmation-actions"><button type="button" className="button subtle" onClick={() => setLearnOpen(false)} disabled={learning}>Cancel</button><button type="button" className="button primary" onClick={() => void startLearning()} disabled={learning || busy || !project.folders.length}>{learning ? 'Documenting…' : 'Start documentation'}</button></div></div>}
+    <div className="project-editor-actions"><button type="button" className="button subtle" onClick={onOpen} disabled={!project.id}>Open project</button><div className="project-editor-actions-right">{project.id && <button type="button" className="button subtle" onClick={() => setLearnOpen(true)} disabled={busy || !project.folders.length}>Learn this system</button>}{onDelete && <button type="button" className="button danger-quiet" onClick={onDelete} disabled={busy}>Delete</button>}<button type="button" className="button primary" onClick={onSave} disabled={busy || !project.name.trim() || project.folders.length === 0}>{busy ? 'Saving…' : 'Save project'}</button></div></div>
   </section>
 }
 
@@ -1014,16 +1174,180 @@ function TerminalView({ project, onNotice, onHistory }: { project?: Project; onN
 }
 
 function HistoryView({ entries, kind, onKindChange }: { entries: HistoryEntry[]; kind: string; onKindChange: (kind: string) => void }) {
-  const filters = [{ value: '', label: 'All activity' }, { value: 'planning', label: 'Planning' }, { value: 'prompt', label: 'Prompts' }, { value: 'builder_prompt', label: 'Builder' }, { value: 'conversation', label: 'Conversations' }, { value: 'terminal', label: 'Terminal' }, { value: 'project', label: 'Projects' }]
+  const filters = [{ value: '', label: 'All activity' }, { value: 'planning', label: 'Planning' }, { value: 'prompt', label: 'Prompts' }, { value: 'builder_prompt', label: 'Builder' }, { value: 'conversation', label: 'Conversations' }, { value: 'system_learning', label: 'Documentation' }, { value: 'terminal', label: 'Terminal' }, { value: 'project', label: 'Projects' }]
   return <div className="view-stack history-page">
     <div className="view-heading"><div><span className="section-kicker">Local record</span><h1>History</h1><p>Prompts, agent responses, terminal commands, and project activity for the active project.</p></div><div className="history-filter" role="tablist" aria-label="History filters">{filters.map((filter) => <button type="button" key={filter.value} className={kind === filter.value ? 'active' : ''} onClick={() => onKindChange(filter.value)}>{filter.label}</button>)}</div></div>
-    <section className="history-list">{entries.map((entry) => <article className={`panel-card history-entry history-kind-${entry.kind}`} key={entry.id}><div className="history-entry-topline"><span className="history-kind">{entry.kind}</span><time>{formatTime(entry.createdAt)}</time></div><h2>{entry.title}</h2>{entry.content && <pre>{entry.content}</pre>}</article>)}{entries.length === 0 && <div className="empty-state panel-card"><strong>No history yet</strong><span>Activity will appear here as the project runs agents or terminal commands.</span></div>}</section>
+    <section className="history-list">{entries.map((entry) => <article className={`panel-card history-entry history-kind-${entry.kind}`} key={entry.id}><div className="history-entry-topline"><span className="history-kind">{entry.kind}</span><time>{formatTime(entry.createdAt)}</time></div><h2>{entry.title}</h2>{entry.content && <div className="history-entry-content">{readableUserText(entry.content)}</div>}</article>)}{entries.length === 0 && <div className="empty-state panel-card"><strong>No history yet</strong><span>Activity will appear here as the project runs agents or terminal commands.</span></div>}</section>
   </div>
 }
 
 type BuilderMode = 'planning' | 'building'
-type BuilderRequestMeta = { prompt: string; mode: BuilderMode; modelID?: string; reasoningEffort?: string; durationMs?: number }
-type BuilderMessage = { id: number; role: 'user' | 'assistant' | 'system'; text: string; request?: BuilderRequestMeta }
+type BuilderRequestMeta = { prompt: string; mode: BuilderMode; modelID?: string; reasoningEffort?: string; subagentApprovalProfile?: string; durationMs?: number }
+type BuilderMessage = { id: number; role: 'user' | 'assistant' | 'system'; text: string; request?: BuilderRequestMeta; scope?: BuilderMode }
+
+const builderFallbackActivities: Record<BuilderMode, string[]> = {
+  planning: ['Reviewing the request', 'Checking assumptions', 'Organizing the next questions'],
+  building: ['Reading the agreed scope', 'Mapping agent responsibilities', 'Drafting the workflow'],
+}
+
+type BuilderSessionSnapshot = {
+  version: 3
+  projectID: string
+  mode: BuilderMode
+  prompt: string
+  planningThreadID: string
+  builderThreadID: string
+  plannerAgentID: string
+  messages: BuilderMessage[]
+  proposal: BuilderProposal | null
+  selectedModelID: string
+  selectedEffort: string
+  subagentApprovalProfile: string
+  confirming: boolean
+  planningHistoryCutoff: string
+}
+
+type PersistedBuilderSession = Partial<Omit<BuilderSessionSnapshot, 'version'>> & { version?: number }
+
+const builderSessionStoragePrefix = 'centurion.builder-session.v3'
+const previousBuilderSessionStoragePrefix = 'centurion.builder-session.v2'
+const legacyBuilderSessionStoragePrefix = 'centurion.builder-session.v1'
+
+function builderSessionStorageKey(projectID: string): string {
+  return `${builderSessionStoragePrefix}.${encodeURIComponent(projectID)}`
+}
+
+function previousBuilderSessionStorageKey(projectID: string): string {
+  return `${previousBuilderSessionStoragePrefix}.${encodeURIComponent(projectID)}`
+}
+
+function legacyBuilderSessionStorageKey(projectID: string): string {
+  return `${legacyBuilderSessionStoragePrefix}.${encodeURIComponent(projectID)}`
+}
+
+function parseBuilderMessage(value: unknown): BuilderMessage | null {
+  if (!value || typeof value !== 'object') return null
+  const candidate = value as Partial<BuilderMessage>
+  if (typeof candidate.id !== 'number'
+    || !Number.isFinite(candidate.id)
+    || (candidate.role !== 'user' && candidate.role !== 'assistant' && candidate.role !== 'system')
+    || typeof candidate.text !== 'string') return null
+  const request = candidate.request && typeof candidate.request === 'object' ? candidate.request as BuilderRequestMeta : undefined
+  const scope = candidate.scope === 'planning' || candidate.scope === 'building' ? candidate.scope : request?.mode
+  return { id: candidate.id, role: candidate.role, text: candidate.text, request, scope }
+}
+
+function inferBuilderMessageScopes(messages: BuilderMessage[]): BuilderMessage[] {
+  let currentScope: BuilderMode = 'planning'
+  return messages.map((message, index) => {
+    const explicitScope = message.scope ?? message.request?.mode
+    if (explicitScope === 'planning' || explicitScope === 'building') {
+      currentScope = explicitScope
+      return { ...message, scope: explicitScope }
+    }
+    const nextScopedMessage = messages.slice(index + 1).find((candidate) => candidate.scope === 'planning' || candidate.scope === 'building' || candidate.request?.mode === 'planning' || candidate.request?.mode === 'building')
+    const inferredScope = nextScopedMessage?.scope ?? nextScopedMessage?.request?.mode ?? currentScope
+    return { ...message, scope: inferredScope }
+  })
+}
+
+function readBuilderSession(projectID: string): BuilderSessionSnapshot | null {
+  try {
+    let raw = window.localStorage.getItem(builderSessionStorageKey(projectID))
+    let migrated = false
+    let sourceVersion = 3
+    if (!raw) {
+      raw = window.localStorage.getItem(previousBuilderSessionStorageKey(projectID))
+      migrated = Boolean(raw)
+      sourceVersion = 2
+    }
+    if (!raw) {
+      raw = window.localStorage.getItem(legacyBuilderSessionStorageKey(projectID))
+      migrated = Boolean(raw)
+      sourceVersion = 1
+    }
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as PersistedBuilderSession
+    const parsedVersion = parsed.version ?? sourceVersion
+    if ((parsedVersion !== 1 && parsedVersion !== 2 && parsedVersion !== 3) || parsed.projectID !== projectID || !Array.isArray(parsed.messages)) return null
+    const isCurrent = !migrated && parsedVersion === 3
+    const canPreserveSelection = parsedVersion >= 2
+    return {
+      version: 3,
+      projectID,
+      mode: parsed.mode === 'building' ? 'building' : 'planning',
+      prompt: typeof parsed.prompt === 'string' ? parsed.prompt : '',
+      // v1 and v2 proposals may contain a model chosen by the Builder itself.
+      // Do not reuse their threads or proposals; a fresh request is required
+      // after the application model selection becomes authoritative.
+      planningThreadID: isCurrent && typeof parsed.planningThreadID === 'string' ? parsed.planningThreadID : '',
+      builderThreadID: isCurrent && typeof parsed.builderThreadID === 'string' ? parsed.builderThreadID : '',
+      plannerAgentID: typeof parsed.plannerAgentID === 'string' ? parsed.plannerAgentID : '',
+      messages: inferBuilderMessageScopes(parsed.messages.map(parseBuilderMessage).filter((message): message is BuilderMessage => message !== null)).slice(-80),
+      proposal: isCurrent && parsed.proposal && typeof parsed.proposal === 'object' ? parsed.proposal as BuilderProposal : null,
+      selectedModelID: canPreserveSelection && typeof parsed.selectedModelID === 'string' ? parsed.selectedModelID : '',
+      selectedEffort: canPreserveSelection && typeof parsed.selectedEffort === 'string' ? parsed.selectedEffort : '',
+      subagentApprovalProfile: parsed.subagentApprovalProfile === 'autonomous' ? 'autonomous' : 'on_request',
+      confirming: isCurrent && parsed.confirming === true,
+      planningHistoryCutoff: typeof parsed.planningHistoryCutoff === 'string' ? parsed.planningHistoryCutoff : '',
+    }
+  } catch {
+    return null
+  }
+}
+
+function persistBuilderSession(snapshot: BuilderSessionSnapshot): void {
+  if (!snapshot.projectID) return
+  const key = builderSessionStorageKey(snapshot.projectID)
+  const isEmpty = snapshot.messages.length === 0
+    && !snapshot.prompt.trim()
+    && !snapshot.planningThreadID
+    && !snapshot.builderThreadID
+    && !snapshot.proposal
+    && !snapshot.selectedModelID
+    && !snapshot.selectedEffort
+    && snapshot.subagentApprovalProfile === 'on_request'
+    && !snapshot.planningHistoryCutoff
+  try {
+    if (isEmpty) {
+      window.localStorage.removeItem(key)
+      return
+    }
+    window.localStorage.setItem(key, JSON.stringify({ ...snapshot, messages: snapshot.messages.slice(-80) }))
+  } catch {
+    try {
+      window.localStorage.setItem(key, JSON.stringify({ ...snapshot, messages: snapshot.messages.slice(-24), proposal: null }))
+    } catch {
+      // Local persistence is best effort; the backend still records the exchange in history.
+    }
+  }
+}
+
+function planningHistoryMessages(entries: HistoryEntry[], cutoff = ''): { messages: BuilderMessage[]; threadID: string } {
+  const messages: BuilderMessage[] = []
+  let nextID = 1
+  let threadID = ''
+  const cutoffTime = cutoff ? Date.parse(cutoff) : Number.NaN
+  const sorted = [...entries].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))
+  for (const entry of sorted) {
+    if (Number.isFinite(cutoffTime) && Date.parse(entry.createdAt) <= cutoffTime) continue
+    const role = entry.kind === 'planning_prompt' ? 'user' : entry.kind === 'planning_response' ? 'assistant' : undefined
+    if (!role || !entry.content) continue
+    const metadata = entry.metadata ?? {}
+    const metadataThreadID = typeof metadata.threadID === 'string' ? metadata.threadID : ''
+    if (metadataThreadID) threadID = metadataThreadID
+    const modelID = typeof metadata.modelID === 'string' ? metadata.modelID : undefined
+    const reasoningEffort = typeof metadata.reasoningEffort === 'string' ? metadata.reasoningEffort : undefined
+    messages.push({
+      id: nextID++,
+      role,
+      text: entry.content,
+      scope: 'planning',
+      request: role === 'user' ? { prompt: entry.content, mode: 'planning', modelID, reasoningEffort } : { prompt: '', mode: 'planning', modelID, reasoningEffort },
+    })
+  }
+  return { messages, threadID }
+}
 
 type CodexBlock =
   | { kind: 'paragraph'; lines: string[] }
@@ -1194,12 +1518,61 @@ function CodexResponse({ text, messageID, copiedCodeID, onCopyCode }: { text: st
 }
 
 function planningBrief(messages: BuilderMessage[], project: Project): string {
-  const transcript = messages
-    .slice(-16)
-    .map((message) => `${message.role === 'user' ? 'User' : message.role === 'assistant' ? 'Planning lead' : 'Centurion'}:\n${message.text}`)
+  const planningMessages = messages.filter((message) => (message.scope === 'planning' || message.request?.mode === 'planning') && message.role !== 'system')
+  const source = planningMessages.length > 0 ? planningMessages : messages.filter((message) => message.role !== 'system')
+  const firstBrief = source.find((message) => message.role === 'user')
+  const recent = source.slice(-14)
+  const selected = firstBrief
+    ? [firstBrief, ...recent.filter((message) => message.id !== firstBrief.id)]
+    : recent
+  const formatMessage = (message: BuilderMessage): string => {
+    const role = message.role === 'user' ? 'User' : message.role === 'assistant' ? 'Planning lead' : 'Centurion'
+    return `${role}:\n${message.text}`
+  }
+  const originalBrief = firstBrief ? `Original user brief:\n${formatMessage(firstBrief)}` : ''
+  const recentTranscript = selected
+    .filter((message) => message.id !== firstBrief?.id)
+    .map(formatMessage)
     .join('\n\n')
-  const boundedTranscript = transcript.length > 12000 ? `[Earlier messages omitted for token efficiency]\n${transcript.slice(-12000)}` : transcript
-  return `Prepare a Centurion execution proposal for the active project "${project.name}" from the approved planning conversation below. Preserve the agreed outcome, constraints, acceptance criteria, agent responsibilities, approval boundaries, and handoffs. Create only the agents and minimal connected workflow needed to execute the plan. This is the handoff from planning to the configuration builder. Return a reviewable proposal draft; do not claim that anything was saved.\n\n<approved_planning_conversation>\n${boundedTranscript}\n</approved_planning_conversation>`
+  // This crosses into a brand-new Builder thread, so it is not covered by the
+  // Planning thread's retained context. Keep the original goal plus recent
+  // decisions, but avoid paying to resend an entire long planning transcript.
+  const maxTranscriptBytes = 16 * 1024
+  const originalBudget = 4 * 1024
+  const boundedOriginal = truncateUtf8(originalBrief, originalBudget)
+  const separator = boundedOriginal ? '\n\n[Older planning details omitted for token efficiency]\n\n' : ''
+  const remainingBytes = Math.max(0, maxTranscriptBytes - new TextEncoder().encode(boundedOriginal + separator).length)
+  const boundedRecent = truncateUtf8End(recentTranscript, remainingBytes)
+  const boundedTranscript = [boundedOriginal, boundedRecent].filter(Boolean).join(separator)
+  return `Prepare a Centurion execution proposal for the active project "${project.name}" from the approved planning conversation below. Preserve the original user outcome, agreed constraints, acceptance criteria, agent responsibilities, approval boundaries, and handoffs. Ignore stale error messages, discarded proposals, and UI diagnostics as requirements. Create only the agents and minimal connected workflow needed to execute the plan. If the scope is not ready or a safe implementation cannot be inferred, report a blocking note instead of claiming that code or configuration is ready. This is the handoff from planning to the configuration builder. Return a reviewable proposal draft; do not claim that anything was saved.\n\n<approved_planning_conversation>\n${boundedTranscript}\n</approved_planning_conversation>`
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (maxBytes <= 0 || value === '') return ''
+  const encoder = new TextEncoder()
+  if (encoder.encode(value).length <= maxBytes) return value
+  let low = 0
+  let high = value.length
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (encoder.encode(value.slice(0, middle)).length <= maxBytes) low = middle
+    else high = middle - 1
+  }
+  return value.slice(0, low)
+}
+
+function truncateUtf8End(value: string, maxBytes: number): string {
+  if (maxBytes <= 0 || value === '') return ''
+  const encoder = new TextEncoder()
+  if (encoder.encode(value).length <= maxBytes) return value
+  let low = 0
+  let high = value.length
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (encoder.encode(value.slice(value.length - middle)).length <= maxBytes) low = middle
+    else high = middle - 1
+  }
+  return value.slice(value.length - low)
 }
 
 function BuilderView({
@@ -1230,17 +1603,49 @@ function BuilderView({
   const [proposal, setProposal] = useState<BuilderProposal | null>(null)
   const [selectedModelID, setSelectedModelID] = useState('')
   const [selectedEffort, setSelectedEffort] = useState('')
+  const [subagentApprovalProfile, setSubagentApprovalProfile] = useState('on_request')
   const [busy, setBusy] = useState(false)
+  const [liveActivity, setLiveActivity] = useState<BuilderActivityEvent | null>(null)
+  const [remoteBuilderStatus, setRemoteBuilderStatus] = useState<BuilderStatus | null>(null)
+  const [builderStatusLoading, setBuilderStatusLoading] = useState(true)
   const [confirming, setConfirming] = useState(false)
+  const [planningHistoryCutoff, setPlanningHistoryCutoff] = useState('')
+  const [clearTarget, setClearTarget] = useState<BuilderMode | null>(null)
   const [expandedMessages, setExpandedMessages] = useState<Set<number>>(new Set())
   const [copiedID, setCopiedID] = useState('')
   const [showJumpToLatest, setShowJumpToLatest] = useState(false)
   const messageID = useRef(0)
   const plannerSelectionInitialized = useRef(false)
+  const hydratedSessionProjectID = useRef('')
+  const sessionStateRef = useRef<BuilderSessionSnapshot | null>(null)
   const messagesScrollRef = useRef<HTMLDivElement>(null)
   const followTranscript = useRef(true)
+  const activeRequestMode = useRef<BuilderMode>('planning')
+  const activityHeartbeat = useRef(0)
+  const messagesRef = useRef<BuilderMessage[]>([])
+  const restoredBuilderRequestID = useRef('')
+  const localOperation = useRef<'builder' | 'apply' | ''>('')
 
-  const selectedModel = models.find((model) => model.id === selectedModelID) ?? models.find((model) => model.isDefault) ?? models[0]
+  messagesRef.current = messages
+
+  sessionStateRef.current = project?.id ? {
+    version: 3,
+    projectID: project.id,
+    mode,
+    prompt,
+    planningThreadID,
+    builderThreadID,
+    plannerAgentID,
+    messages,
+    proposal,
+    selectedModelID,
+    selectedEffort,
+    subagentApprovalProfile,
+    confirming,
+    planningHistoryCutoff,
+  } : null
+
+  const selectedModel = selectedModelID ? models.find((model) => model.id === selectedModelID) : undefined
   const selectedPlanner = agents.find((agent) => agent.id === plannerAgentID)
   const efforts = selectedModel?.supportedReasoningEfforts ?? []
   const examples = mode === 'planning'
@@ -1257,15 +1662,140 @@ function BuilderView({
   const hasAssistantReply = messages.some((message) => message.role === 'assistant')
 
   useEffect(() => {
-    if (!selectedModelID && selectedModel?.id) setSelectedModelID(selectedModel.id)
-  }, [selectedModelID, selectedModel?.id])
+    if (models.length === 0 || !selectedModelID || selectedModel) return
+    // A model can disappear between sessions. Reset to the account-level
+    // Codex configuration instead of allowing a stale explicit ID to be sent.
+    setSelectedModelID('')
+    setSelectedEffort('')
+  }, [models, selectedModelID, selectedModel])
+
+  useEffect(() => {
+    const cleanup = Events.On('builder.activity', (event) => {
+      const payload = eventValue<BuilderActivityEvent>(event)
+      if (!payload || typeof payload !== 'object' || (payload.scope !== 'planning' && payload.scope !== 'building')) return
+      if (!busy || payload.scope !== activeRequestMode.current) return
+      activityHeartbeat.current = Date.now()
+      setLiveActivity(payload)
+    })
+    return cleanup
+  }, [busy])
+
+  useEffect(() => {
+    if (!busy) {
+      setLiveActivity(null)
+      return
+    }
+    let nextIndex = 0
+    const interval = window.setInterval(() => {
+      if (Date.now() - activityHeartbeat.current < 5000) return
+      const requestMode = activeRequestMode.current
+      const activity = builderFallbackActivities[requestMode][nextIndex % builderFallbackActivities[requestMode].length]
+      nextIndex += 1
+      setLiveActivity({
+        schemaVersion: 1,
+        timestamp: new Date().toISOString(),
+        sequence: Date.now(),
+        source: 'centurion',
+        scope: requestMode,
+        state: 'working',
+        activity,
+        detail: 'Waiting for the next Codex update.',
+      })
+    }, 3500)
+    return () => window.clearInterval(interval)
+  }, [busy])
 
   useEffect(() => {
     if (plannerSelectionInitialized.current || agents.length === 0) return
+    if (plannerAgentID) {
+      plannerSelectionInitialized.current = true
+      return
+    }
     const preferred = agents.find((agent) => /lead|supervisor|architect|planner/i.test(`${agent.name} ${agent.role}`)) ?? agents[0]
     setPlannerAgentID(preferred.id)
     plannerSelectionInitialized.current = true
-  }, [agents])
+  }, [agents, plannerAgentID])
+
+  useEffect(() => {
+    const projectID = project?.id
+    if (!projectID) {
+      hydratedSessionProjectID.current = ''
+      return
+    }
+
+    const snapshot = readBuilderSession(projectID)
+    hydratedSessionProjectID.current = projectID
+    plannerSelectionInitialized.current = Boolean(snapshot?.plannerAgentID)
+    if (snapshot) {
+      setMode(snapshot.mode)
+      setPrompt(snapshot.prompt)
+      setPlanningThreadID(snapshot.planningThreadID)
+      setBuilderThreadID(snapshot.builderThreadID)
+      setPlannerAgentID(snapshot.plannerAgentID)
+      setMessages(snapshot.messages)
+      setProposal(snapshot.proposal)
+      setSelectedModelID(snapshot.selectedModelID)
+      setSelectedEffort(snapshot.selectedEffort)
+      setSubagentApprovalProfile(snapshot.subagentApprovalProfile)
+      setConfirming(snapshot.confirming)
+      setPlanningHistoryCutoff(snapshot.planningHistoryCutoff)
+      messageID.current = snapshot.messages.reduce((highest, message) => Math.max(highest, message.id), 0)
+    } else {
+      setMode('planning')
+      setPrompt('')
+      setPlanningThreadID('')
+      setBuilderThreadID('')
+      setPlannerAgentID('')
+      setMessages([])
+      setProposal(null)
+      setSelectedModelID('')
+      setSelectedEffort('')
+      setSubagentApprovalProfile('on_request')
+      setConfirming(false)
+      setPlanningHistoryCutoff('')
+      messageID.current = 0
+    }
+    setClearTarget(null)
+    setExpandedMessages(new Set())
+    setCopiedID('')
+    followTranscript.current = true
+    setShowJumpToLatest(false)
+
+    void api.listHistory({ projectID, kind: 'planning', limit: 200 }).then((entries) => {
+      if (hydratedSessionProjectID.current !== projectID) return
+      const activeCutoff = sessionStateRef.current?.projectID === projectID
+        ? sessionStateRef.current.planningHistoryCutoff
+        : snapshot?.planningHistoryCutoff ?? ''
+      const historySession = planningHistoryMessages(entries, activeCutoff)
+      if (historySession.messages.length === 0) return
+      setMessages((current) => {
+        const merged = [...current]
+        for (const historyMessage of historySession.messages) {
+          if (merged.some((message) => message.role === historyMessage.role && message.text === historyMessage.text)) continue
+          const nextID = Math.max(messageID.current, ...merged.map((message) => message.id), 0) + 1
+          messageID.current = nextID
+          merged.push({ ...historyMessage, id: nextID })
+        }
+        return merged.slice(-80)
+      })
+      // History is still useful for restoring the transcript, but it must not
+      // silently resurrect an old thread whose model may differ from the
+      // current account configuration. Only an explicitly persisted session
+      // thread is safe to resume.
+      if (snapshot?.planningThreadID && historySession.threadID) setPlanningThreadID((current) => current || historySession.threadID)
+    }).catch(() => undefined)
+  }, [project?.id])
+
+  useEffect(() => {
+    const projectID = project?.id
+    if (!projectID) return
+    const timeout = window.setTimeout(() => {
+      if (hydratedSessionProjectID.current !== projectID) return
+      const snapshot = sessionStateRef.current
+      if (snapshot?.projectID === projectID) persistBuilderSession(snapshot)
+    }, 180)
+    return () => window.clearTimeout(timeout)
+  }, [project?.id, mode, prompt, planningThreadID, builderThreadID, plannerAgentID, messages, proposal, selectedModelID, selectedEffort, subagentApprovalProfile, confirming, planningHistoryCutoff])
 
   useEffect(() => {
     const container = messagesScrollRef.current
@@ -1277,10 +1807,109 @@ function BuilderView({
     return () => window.cancelAnimationFrame(frame)
   }, [messages.length, busy, expandedMessages])
 
-  const appendMessage = (role: BuilderMessage['role'], text: string, request?: BuilderRequestMeta) => {
+  const appendMessage = (role: BuilderMessage['role'], text: string, request?: BuilderRequestMeta, scope: BuilderMode = request?.mode ?? mode) => {
     messageID.current += 1
-    setMessages((current) => [...current, { id: messageID.current, role, text, request }])
+    setMessages((current) => [...current, { id: messageID.current, role, text, request, scope }])
   }
+
+  useEffect(() => {
+    const projectID = project?.id
+    if (!projectID) {
+      setRemoteBuilderStatus(null)
+      setBuilderStatusLoading(false)
+      return
+    }
+
+    let mounted = true
+    setBuilderStatusLoading(true)
+
+    const syncBuilderStatus = async () => {
+      try {
+        const status = await api.getBuilderStatus()
+        if (!mounted) return
+        setRemoteBuilderStatus(status)
+        setBuilderStatusLoading(false)
+
+        // A single AppService can serve more than one project. Do not move a
+        // proposal into the wrong project when the user switches projects.
+        if (status.projectID && status.projectID !== projectID) return
+
+        const scope: BuilderMode = status.scope === 'building' ? 'building' : 'planning'
+        activeRequestMode.current = scope
+        if (status.state === 'working') {
+          localOperation.current = 'builder'
+          activityHeartbeat.current = Date.now()
+          setBusy(true)
+          setLiveActivity({
+            schemaVersion: status.schemaVersion,
+            timestamp: status.timestamp,
+            sequence: status.sequence,
+            source: status.source,
+            scope,
+            threadID: status.threadID,
+            turnID: status.turnID,
+            state: 'working',
+            activity: status.activity || 'Working on the request',
+            detail: status.detail || 'The Codex turn is active.',
+          })
+          return
+        }
+
+        if (status.state === 'completed') {
+          if (localOperation.current !== 'apply') setBusy(false)
+          if (!status.requestID || restoredBuilderRequestID.current === status.requestID) return
+          restoredBuilderRequestID.current = status.requestID
+
+          if (scope === 'building' && status.builderResponse) {
+            const response = status.builderResponse
+            setMode('building')
+            setBuilderThreadID(response.threadID)
+            setPlanningThreadID('')
+            setProposal(response.proposal)
+            setConfirming(false)
+            const text = response.reply.trim() || response.proposal.summary.trim()
+            if (text && !messagesRef.current.some((message) => message.role === 'assistant' && message.scope === 'building' && message.text === text)) {
+              appendMessage('assistant', text, { prompt: 'Recovered Builder response', mode: 'building' }, 'building')
+            }
+          } else if (scope === 'planning' && status.planningResponse) {
+            const response = status.planningResponse
+            setMode('planning')
+            setPlanningThreadID(response.threadID)
+            const text = response.reply.trim()
+            if (text && !messagesRef.current.some((message) => message.role === 'assistant' && message.scope === 'planning' && message.text === text)) {
+              appendMessage('assistant', text, { prompt: 'Recovered planning response', mode: 'planning' }, 'planning')
+            }
+          }
+          return
+        }
+
+        if (status.state === 'error' && localOperation.current !== 'apply') {
+          setBusy(false)
+          setLiveActivity({
+            schemaVersion: status.schemaVersion,
+            timestamp: status.timestamp,
+            sequence: status.sequence,
+            source: status.source,
+            scope,
+            threadID: status.threadID,
+            turnID: status.turnID,
+            state: 'error',
+            activity: status.activity || 'Request stopped',
+            detail: status.error || status.detail || 'Codex could not complete this request.',
+          })
+        }
+      } catch {
+        if (mounted) setBuilderStatusLoading(false)
+      }
+    }
+
+    void syncBuilderStatus()
+    const interval = window.setInterval(() => void syncBuilderStatus(), 1200)
+    return () => {
+      mounted = false
+      window.clearInterval(interval)
+    }
+  }, [project?.id])
 
   const handleMessagesScroll = () => {
     const container = messagesScrollRef.current
@@ -1325,20 +1954,42 @@ function BuilderView({
       onNotice('Codex is not authenticated. Sign in through the Codex CLI; Centurion does not manage account login.')
       return
     }
-    if (options.recordUser !== false) appendMessage('user', value)
     setPrompt('')
     setProposal(null)
     setConfirming(false)
+    setRemoteBuilderStatus(null)
+    localOperation.current = 'builder'
+    activeRequestMode.current = requestMode
+    activityHeartbeat.current = Date.now()
+    setLiveActivity({
+      schemaVersion: 1,
+      timestamp: new Date().toISOString(),
+      sequence: Date.now(),
+      source: 'centurion',
+      scope: requestMode,
+      state: 'working',
+      activity: requestMode === 'planning' ? 'Starting the planning turn' : 'Preparing the build',
+      detail: 'Connecting the request to Codex.',
+    })
     setBusy(true)
     const startedAt = performance.now()
     try {
+      const userRequest: BuilderRequestMeta = {
+        prompt: value,
+        mode: requestMode,
+        modelID: selectedModelID || undefined,
+        reasoningEffort: selectedEffort || undefined,
+        subagentApprovalProfile,
+      }
       const requestMeta = (durationMs: number): BuilderRequestMeta => ({
         prompt: value,
         mode: requestMode,
-        modelID: selectedModelID || selectedModel?.id,
+        modelID: selectedModelID || undefined,
         reasoningEffort: selectedEffort || undefined,
+        subagentApprovalProfile,
         durationMs,
       })
+      if (options.recordUser !== false) appendMessage('user', value, userRequest, requestMode)
       if (requestMode === 'planning') {
         const response = await api.planWithCodex({
           prompt: value,
@@ -1357,6 +2008,7 @@ function BuilderView({
           threadID: builderThreadID || undefined,
           modelID: selectedModelID || undefined,
           reasoningEffort: selectedEffort || undefined,
+          subagentApprovalProfile,
         })
         setBuilderThreadID(response.threadID)
         setProposal(response.proposal)
@@ -1366,6 +2018,7 @@ function BuilderView({
       appendMessage('system', errorText(error))
       onNotice(errorText(error))
     } finally {
+      localOperation.current = ''
       setBusy(false)
     }
   }
@@ -1393,6 +2046,20 @@ function BuilderView({
       return
     }
     setBusy(true)
+    setRemoteBuilderStatus(null)
+    localOperation.current = 'builder'
+    activeRequestMode.current = 'building'
+    activityHeartbeat.current = Date.now()
+    setLiveActivity({
+      schemaVersion: 1,
+      timestamp: new Date().toISOString(),
+      sequence: Date.now(),
+      source: 'centurion',
+      scope: 'building',
+      state: 'working',
+      activity: 'Preparing the build',
+      detail: 'Transferring the agreed scope to the configuration builder.',
+    })
     const handoffPrompt = planningBrief(messages, project)
     const startedAt = performance.now()
     try {
@@ -1401,26 +2068,51 @@ function BuilderView({
         projectID: project.id,
         modelID: selectedModelID || undefined,
         reasoningEffort: selectedEffort || undefined,
+        subagentApprovalProfile,
+        handoff: true,
       })
       setBuilderThreadID(response.threadID)
+      // The builder now owns the execution handoff. Keep the planning transcript
+      // for review, but stop reusing the Planner thread and its full context.
+      setPlanningThreadID('')
       setProposal(response.proposal)
       setConfirming(false)
       setMode('building')
-      appendMessage('assistant', 'The agreed plan is now a reviewable execution proposal. Check the agents, access levels, and workflow before applying it.', { prompt: handoffPrompt, mode: 'building', modelID: selectedModelID || selectedModel?.id, reasoningEffort: selectedEffort || undefined, durationMs: Math.round(performance.now() - startedAt) })
+      appendMessage('assistant', 'The agreed plan is now a reviewable execution proposal. Check the agents, access levels, models, and workflow before applying it.', { prompt: handoffPrompt, mode: 'building', modelID: selectedModelID || undefined, reasoningEffort: selectedEffort || undefined, durationMs: Math.round(performance.now() - startedAt) })
     } catch (error) {
       appendMessage('system', errorText(error))
       onNotice(errorText(error))
     } finally {
+      localOperation.current = ''
       setBusy(false)
     }
   }
 
   const apply = async (runAfterApply = false) => {
     if (!proposal || busy) return
+    activeRequestMode.current = 'building'
+    localOperation.current = 'apply'
+    activityHeartbeat.current = Date.now()
+    setLiveActivity({
+      schemaVersion: 1,
+      timestamp: new Date().toISOString(),
+      sequence: Date.now(),
+      source: 'centurion',
+      scope: 'building',
+      state: 'working',
+      activity: 'Applying the proposal',
+      detail: 'Validating agents, permissions, and workflow boundaries.',
+    })
     setBusy(true)
     try {
       const result = await onApply(proposal)
+      await api.clearBuilderStatus().catch(() => undefined)
+      setRemoteBuilderStatus(null)
+      restoredBuilderRequestID.current = ''
       appendMessage('assistant', `Applied ${result.agents.length} agent profile${result.agents.length === 1 ? '' : 's'}${result.workflow ? ' and created the workflow.' : '.'}`)
+      // The proposal has been committed; a future builder request should start
+      // with a fresh, compact context instead of carrying the old draft thread.
+      setBuilderThreadID('')
       setProposal(null)
       setConfirming(false)
       if (result.workflow && runAfterApply) {
@@ -1431,18 +2123,59 @@ function BuilderView({
     } catch (error) {
       onNotice(errorText(error))
     } finally {
+      localOperation.current = ''
       setBusy(false)
     }
   }
 
   const discard = () => {
+    void api.clearBuilderStatus().catch(() => undefined)
+    setRemoteBuilderStatus(null)
+    restoredBuilderRequestID.current = ''
     setProposal(null)
+    setBuilderThreadID('')
     setConfirming(false)
     setMode('planning')
     appendMessage('system', 'Proposal discarded. Nothing was changed. You can continue refining the plan.')
   }
 
+  const hasPlanningSession = Boolean(planningThreadID || messages.some((message) => message.scope === 'planning' || message.request?.mode === 'planning'))
+  const hasBuilderSession = Boolean(builderThreadID || proposal || messages.some((message) => message.scope === 'building' || message.request?.mode === 'building'))
+
+  const clearSession = (target: BuilderMode) => {
+    if (busy) return
+    void api.clearBuilderStatus().catch(() => undefined)
+    setRemoteBuilderStatus(null)
+    restoredBuilderRequestID.current = ''
+    const cutoff = new Date().toISOString()
+    setClearTarget(null)
+    setPrompt('')
+    setConfirming(false)
+    setExpandedMessages(new Set())
+    setCopiedID('')
+    followTranscript.current = true
+    setShowJumpToLatest(false)
+    if (target === 'planning') {
+      setMode('planning')
+      setPlanningThreadID('')
+      setBuilderThreadID('')
+      setMessages([])
+      setProposal(null)
+      setPlanningHistoryCutoff(cutoff)
+      onNotice('Plan session cleared. The dependent build draft was cleared too. History remains available.')
+      return
+    }
+    setMode('planning')
+    setBuilderThreadID('')
+    setProposal(null)
+    setMessages((current) => current.filter((message) => message.scope !== 'building' && message.request?.mode !== 'building'))
+    onNotice('Build session cleared. The planning conversation was kept.')
+  }
+
   const newConversation = () => {
+    void api.clearBuilderStatus().catch(() => undefined)
+    setRemoteBuilderStatus(null)
+    restoredBuilderRequestID.current = ''
     setMode('planning')
     setPlanningThreadID('')
     setBuilderThreadID('')
@@ -1450,6 +2183,8 @@ function BuilderView({
     setProposal(null)
     setConfirming(false)
     setPrompt('')
+    setPlanningHistoryCutoff(new Date().toISOString())
+    setClearTarget(null)
     setExpandedMessages(new Set())
     setCopiedID('')
     followTranscript.current = true
@@ -1459,49 +2194,100 @@ function BuilderView({
   const workflow = proposal?.workflow ?? null
   const draftAgentByID = new Map((proposal?.agents ?? []).map((agent) => [agent.temporaryID, agent]))
   const lastAssistantMessageID = [...messages].reverse().find((message) => message.role === 'assistant')?.id
+  const activeActivity = liveActivity?.scope === activeRequestMode.current ? liveActivity : null
+  const activeActivityMode = activeRequestMode.current
+  const fallbackActivity = builderFallbackActivities[activeActivityMode][0]
+  const activityLabel = activeActivity?.activity ?? fallbackActivity
+  const activityDetail = activeActivity?.detail ?? 'The Codex turn is active.'
+  const remoteStatusForProject = remoteBuilderStatus && (!remoteBuilderStatus.projectID || !project?.id || remoteBuilderStatus.projectID === project.id)
+    ? remoteBuilderStatus
+    : null
+  const busyButtonLabel = activeActivity?.activity === 'Applying the proposal'
+    ? 'Applying…'
+    : activeActivityMode === 'planning' ? 'Planning…' : 'Drafting…'
   const responsePreview = (text: string) => {
     const compact = text.replace(/```[\s\S]*?```/g, '[Code block]').replace(/\s+/g, ' ').trim()
     return compact.length > 520 ? `${compact.slice(0, 520).trimEnd()}…` : compact
+  }
+  const changeModelSelection = (nextModelID: string) => {
+    const changed = nextModelID !== selectedModelID
+    const hadThread = Boolean(planningThreadID || builderThreadID)
+    const hadProposal = Boolean(proposal)
+    if (changed && hadThread) {
+      // A Codex thread can retain the model it was created with. Starting a
+      // fresh thread is the only safe way to make the new selection—or the
+      // account config—authoritative for the next turn.
+      setPlanningThreadID('')
+      setBuilderThreadID('')
+    }
+    if (changed && hadProposal) {
+      setProposal(null)
+      setConfirming(false)
+    }
+    if (changed && (hadThread || hadProposal)) onNotice(hadProposal
+      ? 'Model changed. The previous draft was cleared; generate it again under the new selection.'
+      : 'Model changed. The next Codex request will start a new thread.')
+    setSelectedModelID(nextModelID)
+    setSelectedEffort('')
+  }
+  const changeEffortSelection = (nextEffort: string) => {
+    const changed = nextEffort !== selectedEffort
+    const hadThread = Boolean(planningThreadID || builderThreadID)
+    const hadProposal = Boolean(proposal)
+    if (changed && hadThread) {
+      setPlanningThreadID('')
+      setBuilderThreadID('')
+    }
+    if (changed && hadProposal) {
+      setProposal(null)
+      setConfirming(false)
+    }
+    if (changed && (hadThread || hadProposal)) onNotice(hadProposal
+      ? 'Reasoning effort changed. The previous draft was cleared; generate it again under the new selection.'
+      : 'Reasoning effort changed. The next Codex request will start a new thread.')
+    setSelectedEffort(nextEffort)
   }
   return (
     <div className="view-stack builder-page">
       <div className="view-heading builder-heading">
         <div><span className="section-kicker">Configuration assistant</span><h1>Build with Codex</h1><p>Talk through the outcome with a planning lead, then turn the agreed scope into agents and a visual workflow.</p></div>
-        <div className="builder-heading-meta"><span className={`builder-connection ${auth.status === 'logged_in' ? 'online' : ''}`}><span />{auth.status === 'logged_in' ? 'Codex ready' : 'Codex offline'}</span>{project && <span className="builder-project-name">{project.name}</span>}<div className="builder-mode-switch" role="tablist" aria-label="Builder mode"><button type="button" role="tab" aria-selected={mode === 'planning'} className={mode === 'planning' ? 'active' : ''} onClick={() => setMode('planning')}><span className="builder-mode-dot" />Plan</button><button type="button" role="tab" aria-selected={mode === 'building'} className={mode === 'building' ? 'active' : ''} onClick={() => setMode('building')}><span className="builder-mode-dot" />Build</button></div></div>
+        <div className="builder-heading-meta"><span className={`builder-connection ${auth.status === 'logged_in' ? 'online' : ''}`}><span />{auth.status === 'logged_in' ? 'Codex ready' : 'Codex offline'}</span>{remoteStatusForProject?.state === 'working' && <span className="builder-request-state working"><span />Builder running · {remoteStatusForProject.scope === 'building' ? 'build' : 'plan'}</span>}{remoteStatusForProject?.state === 'error' && <span className="builder-request-state error"><span />Builder stopped</span>}{project && <span className="builder-project-name">{project.name}</span>}<div className="builder-mode-switch" role="tablist" aria-label="Builder mode"><button type="button" role="tab" aria-selected={mode === 'planning'} className={mode === 'planning' ? 'active' : ''} onClick={() => setMode('planning')}><span className="builder-mode-dot" />Plan</button><button type="button" role="tab" aria-selected={mode === 'building'} className={mode === 'building' ? 'active' : ''} onClick={() => setMode('building')}><span className="builder-mode-dot" />Build</button></div></div>
       </div>
       {!project ? <div className="empty-state panel-card"><strong>Choose a project first</strong><span>The planning room uses project folders as the safe workspace boundary.</span></div> : <div className="builder-layout">
         <section className="panel-card builder-chat" aria-label={mode === 'planning' ? 'Codex planning room' : 'Codex builder chat'}>
-          <div className="builder-chat-header"><div><span className="eyebrow">{mode === 'planning' ? 'Planning room' : 'Execution handoff'}</span><h2>{mode === 'planning' ? 'Shape the plan together' : 'Review the execution proposal'}</h2></div><div className="builder-chat-header-actions"><span className="builder-chat-scope">{mode === 'planning' ? 'Read-only' : 'Draft only'}</span><button type="button" className="link-button" onClick={newConversation} disabled={busy}>New chat</button></div></div>
+          <div className="builder-chat-header"><div><span className="eyebrow">{mode === 'planning' ? 'Planning room' : 'Execution handoff'}</span><h2>{mode === 'planning' ? 'Shape the plan together' : 'Review the execution proposal'}</h2></div><div className="builder-chat-header-actions"><span className="builder-chat-scope">{mode === 'planning' ? 'Read-only' : 'Draft only'}</span>{clearTarget ? <div className="builder-clear-confirm" role="alertdialog" aria-label={`Clear ${clearTarget === 'planning' ? 'plan' : 'build'} session`}><span>Clear {clearTarget === 'planning' ? 'plan' : 'build'} session?</span><button type="button" className="button danger-quiet small" onClick={() => clearSession(clearTarget)} disabled={busy}>Clear</button><button type="button" className="button subtle small" onClick={() => setClearTarget(null)} disabled={busy}>Cancel</button></div> : <div className="builder-session-actions" aria-label="Session actions"><button type="button" className="link-button builder-clear-button" onClick={() => setClearTarget('planning')} disabled={busy || !hasPlanningSession}>Clear plan</button><button type="button" className="link-button builder-clear-button" onClick={() => setClearTarget('building')} disabled={busy || !hasBuilderSession}>Clear build</button></div>}<button type="button" className="link-button" onClick={newConversation} disabled={busy}>New chat</button></div></div>
           {messages.length === 0 ? <div className="builder-welcome"><div className="builder-welcome-mark">{mode === 'planning' ? '◎' : '✦'}</div><div><strong>{mode === 'planning' ? 'Start with the outcome and constraints.' : 'Turn the agreement into a build.'}</strong><p>{mode === 'planning' ? 'Explain what you want to accomplish. The planning lead will ask focused questions, surface risks, and add ideas before anything is delegated.' : 'The builder will translate the agreed plan into reviewable agent profiles and a bounded visual workflow.'}</p></div><div className="builder-example-list">{examples.map((example) => <button type="button" key={example} onClick={() => setPrompt(example)}>{example}<span>Use example →</span></button>)}</div></div> : <div className="builder-transcript">
             <div className="builder-messages" ref={messagesScrollRef} onScroll={handleMessagesScroll} aria-live="polite">
               {messages.map((message) => {
-                const isLongResponse = message.role === 'assistant' && (message.text.length > 2400 || message.text.split('\n').length > 36)
-                const isCollapsed = isLongResponse && !expandedMessages.has(message.id)
-                const model = message.request?.modelID ? models.find((item) => item.id === message.request?.modelID) : undefined
-                const label = message.role === 'user' ? 'You' : message.role === 'assistant' ? (message.request?.mode === 'planning' ? 'Planning lead' : 'Codex') : 'Centurion'
+                const displayText = message.role === 'user' ? message.text : readableUserText(message.text)
+                const isLongResponse = message.role === 'assistant' && (displayText.length > 2400 || displayText.split('\n').length > 36)
+				const isCollapsed = isLongResponse && !expandedMessages.has(message.id)
+				const model = message.request?.modelID ? models.find((item) => item.id === message.request?.modelID) : undefined
+				const modelLabel = message.request?.modelID ? (model?.displayName ?? message.request.modelID) : 'Account default'
+				const label = message.role === 'user' ? 'You' : message.role === 'assistant' ? (message.request?.mode === 'planning' ? 'Planning lead' : 'Codex') : 'Centurion'
                 return <article className={`builder-message builder-message-${message.role}`} key={message.id}>
                   <div className="builder-message-topline">
                     <span className="builder-message-label">{label}</span>
                     <div className="builder-message-tools">
-                      {message.request && <span className="builder-message-meta">{model?.displayName ?? 'Codex'} · {message.request.reasoningEffort ?? 'auto'}{message.request.durationMs ? ` · ${message.request.durationMs}ms` : ''}</span>}
-                      <button type="button" className="builder-message-copy" onClick={() => void copyValue(message.text, `message-${message.id}`)} aria-label={`Copy ${label.toLowerCase()} response`}>{copiedID === `message-${message.id}` ? 'Copied' : 'Copy'}</button>
+					  {message.request && <span className="builder-message-meta">{modelLabel} · {message.request.reasoningEffort ?? 'automatic'}{message.request.durationMs ? ` · ${message.request.durationMs}ms` : ''}</span>}
+                      <button type="button" className="builder-message-copy" onClick={() => void copyValue(displayText, `message-${message.id}`)} aria-label={`Copy ${label.toLowerCase()} response`}>{copiedID === `message-${message.id}` ? 'Copied' : 'Copy'}</button>
                     </div>
                   </div>
                   <div className={`builder-message-body ${isCollapsed ? 'collapsed' : ''}`}>
-                    {isCollapsed ? <p className="codex-response-preview">{responsePreview(message.text)}</p> : <CodexResponse text={message.text} messageID={message.id} copiedCodeID={copiedID} onCopyCode={(code, codeID) => void copyValue(code, codeID)} />}
+                    {isCollapsed ? <p className="codex-response-preview">{responsePreview(displayText)}</p> : <CodexResponse text={displayText} messageID={message.id} copiedCodeID={copiedID} onCopyCode={(code, codeID) => void copyValue(code, codeID)} />}
                     {isLongResponse && <button type="button" className="builder-expand-button" onClick={() => toggleExpanded(message.id)}>{isCollapsed ? 'Show full response' : 'Collapse response'}</button>}
                   </div>
                   {message.role === 'assistant' && message.request && message.id === lastAssistantMessageID && <div className="builder-reply-actions"><button type="button" className="builder-reply-action" onClick={() => void regenerateResponse(message)} disabled={busy}>Regenerate</button><button type="button" className="builder-reply-action" onClick={() => void continueResponse(message)} disabled={busy}>Continue</button></div>}
                 </article>
               })}
-              {busy && <div className="builder-thinking"><span className="builder-thinking-dot" />{mode === 'planning' ? 'The planning lead is thinking…' : 'Codex is drafting a proposal…'}</div>}
+              {busy && <div className={`builder-thinking builder-thinking-${activeActivity?.state === 'error' ? 'error' : 'working'}`} role="status" aria-live="polite"><span className="builder-thinking-indicator" aria-hidden="true"><span className="builder-thinking-dot" /></span><span className="builder-thinking-copy"><strong>{activityLabel}</strong><small>{activityDetail}</small></span><span className="builder-thinking-tag">Live activity</span></div>}
             </div>
             {showJumpToLatest && <button type="button" className="builder-jump-latest" onClick={jumpToLatest}><span aria-hidden="true">↓</span>New response</button>}
           </div>}
-          <div className="builder-composer"><div className="builder-composer-label"><span>{mode === 'planning' ? 'Planning brief' : 'Build request'}</span><span>Ctrl+Enter</span></div><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); void send() } }} placeholder={mode === 'planning' ? 'Explain the outcome, constraints, and open questions...' : 'Describe the agents and workflow to create...'} rows={3} aria-label={mode === 'planning' ? 'Explain the project scope to the planning lead' : 'Describe the agents and workflow to create'} /><div className="builder-composer-footer"><span>{mode === 'planning' ? 'Read-only conversation · no tools or file changes.' : 'No changes are made until you apply a proposal.'}</span><div className="builder-composer-actions">{mode === 'planning' && hasAssistantReply && <button type="button" className="button subtle" onClick={() => void prepareBuild()} disabled={busy}>Build from plan</button>}<button type="button" className="button primary" onClick={() => void send()} disabled={busy || !prompt.trim()}>{busy ? 'Working…' : mode === 'planning' ? 'Discuss' : 'Ask Codex'}</button></div></div></div>
+          {remoteStatusForProject?.state === 'working' && <div className="builder-persisted-status" role="status" aria-live="polite"><span className="builder-persisted-status-indicator" /><div><strong>{remoteStatusForProject.activity || 'Builder request in progress'}</strong><small>{remoteStatusForProject.detail || 'This request is still running in the background. You can stay on this screen or navigate away and return.'}</small></div><span className="builder-persisted-status-tag">Reconnected</span></div>}{remoteStatusForProject?.state === 'error' && <div className="builder-persisted-status error" role="alert"><span className="builder-persisted-status-indicator" /><div><strong>{remoteStatusForProject.activity || 'Builder request stopped'}</strong><small>{remoteStatusForProject.error || remoteStatusForProject.detail || 'No proposal was produced.'}</small></div></div>}<div className="builder-composer"><div className="builder-composer-label"><span>{mode === 'planning' ? 'Planning brief' : 'Build request'}</span><span>Ctrl+Enter</span></div><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); void send() } }} placeholder={mode === 'planning' ? 'Explain the outcome, constraints, and open questions...' : 'Describe the agents and workflow to create...'} rows={3} aria-label={mode === 'planning' ? 'Explain the project scope to the planning lead' : 'Describe the agents and workflow to create'} /><div className="builder-composer-footer"><span>{mode === 'planning' ? 'Read-only conversation · no tools or file changes.' : 'No changes are made until you apply a proposal.'}</span><div className="builder-composer-actions">{mode === 'planning' && hasAssistantReply && <button type="button" className="button subtle" onClick={() => void prepareBuild()} disabled={busy || builderStatusLoading}>Build from plan</button>}<button type="button" className="button primary" onClick={() => void send()} disabled={busy || !prompt.trim() || builderStatusLoading}>{busy ? busyButtonLabel : mode === 'planning' ? 'Discuss' : 'Ask Codex'}</button></div></div></div>
         </section>
         <aside className="builder-side">
-          <section className="panel-card builder-controls"><div className="card-topline"><span className="eyebrow">{mode === 'planning' ? 'Planning lead' : 'Builder model'}</span><span className="mini-code">{mode === 'planning' ? 'read-only' : 'low overhead'}</span></div>{mode === 'planning' && <label className="field"><span>Agent</span><select value={plannerAgentID} onChange={(event) => setPlannerAgentID(event.target.value)} disabled={busy || Boolean(planningThreadID)}><option value="">Use Centurion planning lead</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} · {agent.role}</option>)}</select><span className="field-hint">{selectedPlanner ? `${selectedPlanner.name}'s role and instructions guide the conversation. Workspace and tools stay disabled.` : 'No agent profile is available yet, so Centurion uses a read-only planning lead.'}</span></label>}<label className="field"><span>Model</span><select value={selectedModel?.id ?? ''} onChange={(event) => { setSelectedModelID(event.target.value); setSelectedEffort('') }}><option value="">Account default</option>{models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label><label className="field"><span>Reasoning effort</span><select value={selectedEffort} onChange={(event) => setSelectedEffort(event.target.value)}><option value="">Automatic</option>{efforts.map((effort) => <option key={effort.reasoningEffort} value={effort.reasoningEffort}>{effort.reasoningEffort}</option>)}</select></label><p className="field-hint">{mode === 'planning' ? 'The conversation stays read-only. Start a new chat to switch the planning lead.' : 'The builder receives a compact project catalog and returns structured JSON to reduce prompt overhead.'}</p></section>
+           <section className="panel-card builder-controls"><div className="card-topline"><span className="eyebrow">{mode === 'planning' ? 'Planning lead' : 'Builder model'}</span><span className="mini-code">{mode === 'planning' ? 'read-only' : 'config-aware'}</span></div>{mode === 'planning' && <label className="field"><span>Agent</span><select value={plannerAgentID} onChange={(event) => setPlannerAgentID(event.target.value)} disabled={busy || Boolean(planningThreadID)}><option value="">Use Centurion planning lead</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} · {agent.role}</option>)}</select><span className="field-hint">{selectedPlanner ? `${selectedPlanner.name}'s role and instructions guide the conversation. Workspace and tools stay disabled.` : 'No agent profile is available yet, so Centurion uses a read-only planning lead.'}</span></label>}<label className="field"><span>Model</span><select value={selectedModelID} onChange={(event) => changeModelSelection(event.target.value)} disabled={busy || builderStatusLoading}><option value="">Account default</option>{models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label><label className="field"><span>Reasoning effort</span><select value={selectedEffort} onChange={(event) => changeEffortSelection(event.target.value)} disabled={busy || builderStatusLoading}><option value="">Automatic</option>{efforts.map((effort) => <option key={effort.reasoningEffort} value={effort.reasoningEffort}>{effort.reasoningEffort}</option>)}</select></label><div className="field"><span>Subagent Permissions</span><div className="access-picker" role="radiogroup" aria-label="Subagent permissions"><button type="button" className={subagentApprovalProfile === 'autonomous' ? 'active' : ''} onClick={() => setSubagentApprovalProfile('autonomous')} disabled={busy || builderStatusLoading}><strong>Full access</strong><span>Run generated agents without intermediate approval.</span></button><button type="button" className={subagentApprovalProfile !== 'autonomous' ? 'active' : ''} onClick={() => setSubagentApprovalProfile('on_request')} disabled={busy || builderStatusLoading}><strong>Request approval</strong><span>Pause before sensitive commands, files, or external effects.</span></button></div><span className="field-hint">Applied to every new subagent in the proposal. Workspace boundaries still apply.</span></div><p className="field-hint">Account default leaves model and automatic effort to your Codex config. Changing a selection starts a new Codex thread.</p></section>
           <section className="panel-card builder-proposal"><div className="card-topline"><div><span className="eyebrow">{mode === 'planning' && !proposal ? 'Execution handoff' : 'Proposal preview'}</span><h2>{proposal ? 'Ready to review' : mode === 'planning' ? 'Waiting for agreement' : 'Nothing drafted yet'}</h2></div>{proposal && <span className="builder-draft-badge">Draft</span>}</div>{proposal ? <><p className="builder-proposal-summary">{proposal.summary}</p>{proposal.notes && proposal.notes.length > 0 && <div className="builder-notes"><span className="eyebrow">Notes</span>{proposal.notes.map((note) => <p key={note}>{note}</p>)}</div>}<div className="builder-agent-preview"><div className="builder-preview-heading"><span>Agents</span><strong>{proposal.agents.length}</strong></div>{proposal.agents.map((agent) => { const agentModel = models.find((model) => model.id === agent.modelID); return <div className="builder-agent-row" key={agent.temporaryID}><div className="builder-agent-avatar">{agent.name.slice(0, 1).toUpperCase()}</div><div><strong>{agent.name}</strong><small>{agent.role} · {agentModel?.displayName ?? agent.modelID ?? 'Builder model'}{agent.reasoningEffort ? ` · ${agent.reasoningEffort}` : ''}</small></div><span className={`builder-access ${agent.approvalProfile === 'autonomous' ? 'complete' : ''}`}>{agent.approvalProfile === 'autonomous' ? 'Full access' : 'Approval'}</span></div>})}</div>{workflow && <div className="builder-workflow-preview"><div className="builder-preview-heading"><span>Workflow</span><strong>{workflow.nodes.length} nodes · {workflow.edges.length} connections</strong></div><div className="builder-route">{workflow.nodes.slice(0, 8).map((node, index) => <span key={node.id}><span className={`builder-node-type builder-node-${node.type}`}>{node.type === 'agent' ? (draftAgentByID.get(node.agentID ?? '')?.name ?? 'Agent') : node.type}</span>{index < Math.min(workflow.nodes.length, 8) - 1 && <b>→</b>}</span>)}</div></div>}<div className="builder-proposal-actions">{!confirming ? <><button type="button" className="button primary full" onClick={() => setConfirming(true)} disabled={busy}>Review & apply</button><button type="button" className="button subtle full" onClick={discard} disabled={busy}>Discard</button></> : <div className="builder-confirmation"><strong>This will create {proposal.agents.length} agent profile{proposal.agents.length === 1 ? '' : 's'}{workflow ? ' and save one workflow' : ''}.</strong><span>Centurion will validate the workspace, permissions, graph, and loop limits before committing.</span><div><button type="button" className="button subtle" onClick={() => void apply()} disabled={busy}>Apply only</button>{workflow && <button type="button" className="button primary" onClick={() => void apply(true)} disabled={busy}>{busy ? 'Starting…' : 'Apply & run'}</button>}<button type="button" className="button subtle" onClick={() => setConfirming(false)} disabled={busy}>Back</button></div></div>}</div></> : <div className="builder-proposal-empty"><span>{mode === 'planning' ? 'PLAN' : '01'}</span><p>{mode === 'planning' ? 'After the planning lead and you agree on the scope, use Build from plan to generate the agent and workflow proposal here.' : 'Your draft will appear here with agent roles, access levels, models, and the connected workflow.'}</p></div>}</section>
         </aside>
       </div>}
@@ -1576,7 +2362,9 @@ function App() {
   const [schedules, setSchedules] = useState<Schedule[]>([])
   const [mcpServers, setMCPServers] = useState<MCPServer[]>([])
   const [selectedAgentID, setSelectedAgentID] = useState('')
+  const [officeAgentID, setOfficeAgentID] = useState('')
   const [selectedRunID, setSelectedRunID] = useState('')
+  const [runSteps, setRunSteps] = useState<RunStep[]>([])
   const [draftAgent, setDraftAgent] = useState<AgentProfile>(defaultAgent)
   const [draftSchedule, setDraftSchedule] = useState<Schedule>({ id: '', name: 'New routine', workflowID: '', cron: '*/30 * * * *', timezone: 'Local', enabled: true, createdAt: '', updatedAt: '' })
   const [approvals, setApprovals] = useState<Record<string, ApprovalRequest>>({})
@@ -1587,9 +2375,16 @@ function App() {
   const selectedWorkflow = workflows.find((workflow) => workflow.id === selectedWorkflowID) ?? workflows[0]
   const selectedRun = runs.find((run) => run.id === selectedRunID)
   const activeProject = projects.find((project) => project.id === activeProjectID) ?? projects[0]
-  const activeEvents = useMemo(() => events.filter((event) => !selectedRunID || event.runID === selectedRunID).slice(-80), [events, selectedRunID])
+  const activeEvents = useMemo(() => events.filter((event) => !selectedRunID || event.runID === selectedRunID).slice(-200), [events, selectedRunID])
   const workingAgents = agents.filter((agent) => agent.visualState !== 'idle')
   const latestRun = runs[0]
+  const officeAgent = agents.find((agent) => agent.id === officeAgentID) ?? agents[0]
+  const officeRun = selectedRun ?? latestRun
+  const officeWorkflow = officeRun ? workflows.find((workflow) => workflow.id === officeRun.workflowID) : selectedWorkflow
+  const officeAgentNodeIDs = useMemo(() => new Set((officeWorkflow?.nodes ?? []).filter((node) => node.agentID === officeAgent?.id).map((node) => node.id)), [officeWorkflow, officeAgent?.id])
+  const officeAgentSteps = useMemo(() => runSteps.filter((step) => officeAgentNodeIDs.has(step.nodeID)), [runSteps, officeAgentNodeIDs])
+  const officeAgentStep = officeAgentSteps[officeAgentSteps.length - 1]
+  const officeAgentEvents = useMemo(() => activeEvents.filter((event) => event.agentID === officeAgent?.id).slice(-8).reverse(), [activeEvents, officeAgent?.id])
 
   const announce = (message: string) => {
     setNotice(message)
@@ -1609,8 +2404,10 @@ function App() {
       api.listAudit({ projectID, limit: 100 }),
     ])
     if (agentsResult.status === 'fulfilled') {
-      setAgents(agentsResult.value)
-      setSelectedAgentID(agentsResult.value[0]?.id ?? '')
+      const nextAgents = agentsResult.value.map(normalizeAgent)
+      setAgents(nextAgents)
+      setSelectedAgentID(nextAgents[0]?.id ?? '')
+      setOfficeAgentID((current) => nextAgents.some((agent) => agent.id === current) ? current : nextAgents[0]?.id ?? '')
     }
     if (workflowsResult.status === 'fulfilled') {
       setWorkflows(workflowsResult.value)
@@ -1643,7 +2440,12 @@ function App() {
         setDraftProject(activeProjectResult.value)
         setActiveView('office')
       }
-      if (agentsResult.status === 'fulfilled') { setAgents(agentsResult.value); setSelectedAgentID(agentsResult.value[0]?.id ?? '') }
+      if (agentsResult.status === 'fulfilled') {
+        const nextAgents = agentsResult.value.map(normalizeAgent)
+        setAgents(nextAgents)
+        setSelectedAgentID(nextAgents[0]?.id ?? '')
+        setOfficeAgentID(nextAgents[0]?.id ?? '')
+      }
       if (promptsResult.status === 'fulfilled') setSystemPrompts(promptsResult.value)
       if (workflowsResult.status === 'fulfilled') { setWorkflows(workflowsResult.value); setSelectedWorkflowID(workflowsResult.value[0]?.id ?? '') }
       if (runsResult.status === 'fulfilled') { setRuns(runsResult.value); setSelectedRunID(runsResult.value[0]?.id ?? '') }
@@ -1669,7 +2471,15 @@ function App() {
     listen('auth.updated', (value) => setAuth(eventValue<AuthState>(value)))
     listen('models.updated', (value) => { const payload = eventValue<{ models?: ModelInfo[] } | ModelInfo[]>(value); setModels(Array.isArray(payload) ? payload : payload.models ?? []) })
     listen('mcp.status', (value) => { const payload = eventValue<{ servers?: MCPServer[] } | MCPServer[]>(value); setMCPServers(Array.isArray(payload) ? payload : payload.servers ?? []) })
-    listen('run.created', (value) => { const run = eventValue<Run>(value); setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]) ; setSelectedRunID(run.id) })
+    listen('run.created', (value) => {
+      const run = eventValue<Run>(value)
+      setRuns((current) => mergeRunSnapshot(current, run))
+      setSelectedRunID(run.id)
+      // The creation event is intentionally lightweight. Reconcile it with
+      // SQLite immediately so a late queued snapshot cannot overwrite a run
+      // that already moved to running or completed.
+      void api.getRun(run.id).then((latest) => setRuns((current) => mergeRunSnapshot(current, latest))).catch(() => undefined)
+    })
     listen('run.updated', () => refreshRuns())
     listen('run.event', (value) => { const event = eventValue<RunEvent>(value); setEvents((current) => [...current.filter((item) => !(item.runID === event.runID && item.sequence === event.sequence)), event].slice(-500)) })
     listen('office.agent.state', (value) => { const state = eventValue<{ agentID: string; state: string }>(value); setAgents((current) => current.map((agent) => agent.id === state.agentID ? { ...agent, visualState: state.state } : agent)) })
@@ -1684,7 +2494,18 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (selectedRunID) void api.getRunEvents(selectedRunID, 0).then(setEvents).catch(() => undefined)
+    if (!selectedRunID) {
+      setEvents([])
+      setRunSteps([])
+      return
+    }
+    const refreshRunDetails = () => {
+      void api.getRunEvents(selectedRunID, 0).then(setEvents).catch(() => undefined)
+      void api.getRunSteps(selectedRunID).then(setRunSteps).catch(() => undefined)
+    }
+    refreshRunDetails()
+    const interval = window.setInterval(refreshRunDetails, 2500)
+    return () => window.clearInterval(interval)
   }, [selectedRunID])
 
   useEffect(() => {
@@ -1698,9 +2519,11 @@ function App() {
   const saveAgent = async () => {
     setBusy(true)
     try {
-      const saved = draftAgent.id ? await api.updateAgent(draftAgent) : await api.createAgent(draftAgent)
+      const payload = normalizeAgent(draftAgent)
+      const saved = normalizeAgent(payload.id ? await api.updateAgent(payload) : await api.createAgent(payload))
       setAgents((current) => [...current.filter((agent) => agent.id !== saved.id), saved].sort((left, right) => left.name.localeCompare(right.name)))
       setSelectedAgentID(saved.id)
+      setOfficeAgentID(saved.id)
       setDraftAgent(saved)
       announce('Agent profile saved.')
     } catch (error) { announce(errorText(error)) } finally { setBusy(false) }
@@ -1768,7 +2591,7 @@ function App() {
     setBusy(true)
     try {
       const result = await api.applyBuilderProposal({ projectID: activeProjectID || undefined, proposal })
-      setAgents((current) => [...current, ...result.agents].sort((left, right) => left.name.localeCompare(right.name)))
+      setAgents((current) => [...current, ...result.agents.map(normalizeAgent)].sort((left, right) => left.name.localeCompare(right.name)))
       if (result.workflow) {
         setWorkflows((current) => [result.workflow as WorkflowDefinition, ...current.filter((item) => item.id !== result.workflow?.id)])
         setSelectedWorkflowID(result.workflow.id)
@@ -1818,6 +2641,24 @@ function App() {
     }
   }
 
+  const learnProjectSystem = async (project: Project, modelID: string, reasoningEffort: string) => {
+    if (!project.id) return
+    setBusy(true)
+    try {
+      const saved = await api.updateProject(project)
+      setDraftProject(saved)
+      setProjects((current) => [saved, ...current.filter((item) => item.id !== saved.id)])
+      const result = await api.learnProjectSystem({ projectID: saved.id, modelID: modelID || undefined, reasoningEffort: reasoningEffort || undefined })
+      const missing = result.missingFiles && result.missingFiles.length > 0 ? ` Missing: ${result.missingFiles.join(', ')}.` : ''
+      announce(result.status === 'completed' ? `System documentation saved in ${result.docsPath}.` : `System documentation is partial in ${result.docsPath}.${missing}`)
+    } catch (error) {
+      announce(errorText(error))
+      throw error
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const deleteProject = async () => {
     if (!draftProject.id) return
     if (!window.confirm(`Delete project “${draftProject.name}”?`)) return
@@ -1856,7 +2697,11 @@ function App() {
     try { await api.deleteSchedule(draftSchedule.id); setSchedules((current) => current.filter((schedule) => schedule.id !== draftSchedule.id)); setDraftSchedule({ id: '', name: 'New routine', workflowID: selectedWorkflow?.id ?? '', cron: '*/30 * * * *', timezone: 'Local', enabled: true, createdAt: '', updatedAt: '' }); announce('Schedule deleted.') } catch (error) { announce(errorText(error)) } finally { setBusy(false) }
   }
 
-  const editAgent = (agent: AgentProfile) => { setSelectedAgentID(agent.id); setDraftAgent(agent) }
+  const editAgent = (agent: AgentProfile) => {
+    const normalized = normalizeAgent(agent)
+    setSelectedAgentID(normalized.id)
+    setDraftAgent(normalized)
+  }
 
   const deleteAgent = async () => {
     if (!draftAgent.id) return
@@ -1908,7 +2753,7 @@ function App() {
   const renderProjects = () => (
     <div className="view-stack projects-page">
       <div className="view-heading"><div><span className="section-kicker">Workspace context</span><h1>Projects</h1><p>Open Centurion into a project and keep every run, folder, prompt, and terminal command in one local context.</p></div><div className="heading-actions"><button className="button subtle" onClick={() => void exportProjectSnapshot()} disabled={!activeProjectID || busy}>Export snapshot</button><button className="button primary" onClick={createProject}>New project</button></div></div>
-      <div className="projects-layout"><section className="project-list panel-card"><div className="project-list-heading"><span className="eyebrow">Your projects</span><span>{projects.length}</span></div>{projects.map((project) => <button type="button" className={`project-list-item ${project.id === activeProjectID ? 'active' : ''} ${project.id === draftProject.id ? 'selected' : ''}`} key={project.id} onClick={() => editProject(project)}><span className="project-list-mark">{project.name.slice(0, 1).toUpperCase()}</span><span className="project-list-copy"><strong>{project.name}</strong><small>{project.folders.length} folder{project.folders.length === 1 ? '' : 's'} · {project.id === activeProjectID ? 'Open now' : 'Local project'}</small></span><span className="project-list-arrow">→</span></button>)}{projects.length === 0 && <div className="empty-state"><strong>No project yet</strong><span>Create one to define the workspace context.</span></div>}</section><ProjectEditor project={draftProject} onChange={setDraftProject} onSave={saveProject} onOpen={() => void openProject(draftProject.id)} onDelete={draftProject.id ? deleteProject : undefined} onChooseFolder={chooseProjectFolder} busy={busy} /></div>
+      <div className="projects-layout"><section className="project-list panel-card"><div className="project-list-heading"><span className="eyebrow">Your projects</span><span>{projects.length}</span></div>{projects.map((project) => <button type="button" className={`project-list-item ${project.id === activeProjectID ? 'active' : ''} ${project.id === draftProject.id ? 'selected' : ''}`} key={project.id} onClick={() => editProject(project)}><span className="project-list-mark">{project.name.slice(0, 1).toUpperCase()}</span><span className="project-list-copy"><strong>{project.name}</strong><small>{project.folders.length} folder{project.folders.length === 1 ? '' : 's'} · {project.id === activeProjectID ? 'Open now' : 'Local project'}</small></span><span className="project-list-arrow">→</span></button>)}{projects.length === 0 && <div className="empty-state"><strong>No project yet</strong><span>Create one to define the workspace context.</span></div>}</section><ProjectEditor project={draftProject} models={models} onChange={setDraftProject} onSave={saveProject} onOpen={() => void openProject(draftProject.id)} onDelete={draftProject.id ? deleteProject : undefined} onChooseFolder={chooseProjectFolder} onLearnSystem={learnProjectSystem} busy={busy} /></div>
     </div>
   )
 
@@ -1925,14 +2770,15 @@ function App() {
         <section className="office-stage" aria-label="2D virtual office">
           <div className="stage-topbar"><div><span className="section-kicker">Now</span><strong>{workingAgents.length ? `${workingAgents.length} active agents` : 'System idle'}</strong></div><span className="stage-clock">{formatTime(new Date().toISOString())} local</span></div>
           <div className="office-rooms">
-            {(['strategy', 'workshop', 'library'] as const).map((room) => { const roomAgents = agents.filter((agent) => agent.roomID === room); const roomLabel = room === 'strategy' ? 'Strategy room' : room === 'workshop' ? 'Workshop' : 'Library'; return <div className={`office-room room-${room}`} key={room}><div className="room-label"><span>{roomLabel}</span><small>{roomAgents.length.toString().padStart(2, '0')} occupants</small></div><div className="room-floor" />{roomAgents.map((agent) => <button className="office-agent" key={agent.id} onClick={() => { editAgent(agent); setActiveView('agents') }}><AgentAvatar agent={agent} /><span className="office-agent-name">{agent.name}</span><small>{stateLabels[agent.visualState] ?? 'Idle'}</small></button>)}</div> })}
+            {(['strategy', 'workshop', 'library'] as const).map((room) => { const roomAgents = agents.filter((agent) => agent.roomID === room); const roomLabel = room === 'strategy' ? 'Strategy room' : room === 'workshop' ? 'Workshop' : 'Library'; return <div className={`office-room room-${room}`} key={room}><div className="room-label"><span>{roomLabel}</span><small>{roomAgents.length.toString().padStart(2, '0')} occupants</small></div><div className="room-floor" />{roomAgents.map((agent) => <button className={`office-agent ${agent.id === officeAgent?.id ? 'selected' : ''}`} key={agent.id} aria-pressed={agent.id === officeAgent?.id} onClick={() => setOfficeAgentID(agent.id)}><AgentAvatar agent={agent} /><span className="office-agent-name">{agent.name}</span><small>{stateLabels[agent.visualState] ?? 'Idle'}</small></button>)}</div> })}
           </div>
           <div className="stage-legend"><span><i className="legend-state working" /> working</span><span><i className="legend-state waiting" /> approval</span><span><i className="legend-state idle" /> idle</span><span className="reduced-note">Text labels accompany every state</span></div>
         </section>
         <aside className="office-inspector">
           <div className="panel-card account-card"><div className="card-topline"><span className="eyebrow">Codex connection</span><StatusPill value={auth.status === 'logged_in' ? 'Online' : auth.status === 'offline' ? 'Offline' : 'Checking'} tone={auth.status === 'logged_in' ? 'success' : auth.status === 'offline' ? 'warning' : 'neutral'} /></div><h2>{auth.plan ? `${auth.plan} connected` : 'Codex-managed session'}</h2><p>{auth.email ?? 'Centurion uses the Codex CLI session already configured on this computer. It does not create or store a separate account login.'}</p>{auth.rateLimit && <div className="quota-line"><span>Current window</span><strong>{auth.rateLimit.usedPercent}% used</strong></div>}<span className="field-hint">If Codex is offline or unauthenticated, sign in from the Codex CLI and reload Centurion.</span></div>
-          <div className="panel-card"><div className="card-topline"><span className="eyebrow">Current run</span><span className="mini-code">{latestRun ? latestRun.id.slice(0, 8) : '—'}</span></div>{latestRun ? <><div className="run-summary"><StatusPill value={statusLabel(latestRun.status)} tone={latestRun.status === 'completed' ? 'success' : latestRun.status === 'failed' ? 'danger' : latestRun.status === 'running' ? 'accent' : 'neutral'} /><span>{formatTime(latestRun.updatedAt)}</span></div><h3>{workflows.find((workflow) => workflow.id === latestRun.workflowID)?.name ?? 'Workflow'}</h3><p className="muted">{latestRun.error ?? (latestRun.currentNodeID ? `Current node: ${latestRun.currentNodeID}` : 'No step selected.')}</p><button className="link-button" onClick={() => { setSelectedRunID(latestRun.id); setActiveView('runs') }}>Open timeline →</button></> : <div className="empty-small"><strong>No recent runs</strong><span>Start a workflow to bring the office to life.</span></div>}</div>
-          <div className="panel-card compact-card"><div className="card-topline"><span className="eyebrow">Team</span><button className="link-button" onClick={() => setActiveView('agents')}>Manage</button></div><div className="agent-strip">{agents.slice(0, 5).map((agent) => <button key={agent.id} title={agent.name} onClick={() => { editAgent(agent); setActiveView('agents') }}><AgentAvatar agent={agent} compact /></button>)}</div><span className="muted">{agents.length} profiles stored locally</span></div>
+          <AgentRunInspector agent={officeAgent} run={officeRun} workflow={officeWorkflow} step={officeAgentStep} events={officeAgentEvents} onOpenProfile={() => { if (officeAgent) { editAgent(officeAgent); setActiveView('agents') } }} onOpenRuns={() => setActiveView('runs')} />
+          <div className="panel-card"><div className="card-topline"><span className="eyebrow">Current run</span><span className="mini-code">{latestRun ? latestRun.id.slice(0, 8) : '—'}</span></div>{latestRun ? <><div className="run-summary"><StatusPill value={statusLabel(latestRun.status)} tone={runTone(latestRun.status)} /><span>{formatTime(latestRun.updatedAt)}</span></div><h3>{workflows.find((workflow) => workflow.id === latestRun.workflowID)?.name ?? 'Workflow'}</h3><p className="muted">{latestRun.error ?? (latestRun.currentNodeID ? `Current node: ${latestRun.currentNodeID}` : 'No step selected.')}</p><button className="link-button" onClick={() => { setSelectedRunID(latestRun.id); setActiveView('runs') }}>Open timeline →</button></> : <div className="empty-small"><strong>No recent runs</strong><span>Start a workflow to bring the office to life.</span></div>}</div>
+          <div className="panel-card compact-card"><div className="card-topline"><span className="eyebrow">Team</span><button className="link-button" onClick={() => setActiveView('agents')}>Manage</button></div><div className="agent-strip">{agents.slice(0, 5).map((agent) => <button key={agent.id} title={`Inspect ${agent.name}`} className={agent.id === officeAgent?.id ? 'selected' : ''} onClick={() => setOfficeAgentID(agent.id)}><AgentAvatar agent={agent} compact /></button>)}</div><span className="muted">{agents.length} profiles stored locally</span></div>
         </aside>
       </div>
       <Timeline events={activeEvents} onOpenRuns={() => setActiveView('runs')} />
@@ -1948,7 +2794,7 @@ function App() {
   )
 
   const renderRuns = () => (
-    <div className="view-stack"><div className="view-heading"><div><span className="section-kicker">History</span><h1>Runs</h1><p>Open a run to inspect steps, approvals, errors, and results.</p></div><button className="button primary" onClick={() => void startRun()} disabled={!selectedWorkflow || busy}>Run workflow</button></div><div className="runs-layout"><section className="run-list panel-card">{runs.map((run) => <button className={`run-list-item ${run.id === selectedRunID ? 'selected' : ''}`} key={run.id} onClick={() => setSelectedRunID(run.id)}><div><strong>{workflows.find((workflow) => workflow.id === run.workflowID)?.name ?? 'Workflow'}</strong><small>{run.id.slice(0, 12)} · {formatTime(run.startedAt)}</small></div><StatusPill value={statusLabel(run.status)} tone={run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : run.status === 'running' ? 'accent' : 'neutral'} /></button>)}{runs.length === 0 && <div className="empty-state"><strong>No runs</strong><span>The first run will appear here.</span></div>}</section><section className="run-detail panel-card">{selectedRun ? <><div className="card-topline"><span className="eyebrow">Selected run</span><span className="mini-code">{selectedRun.id}</span></div><div className="run-detail-heading"><div><h2>{workflows.find((workflow) => workflow.id === selectedRun.workflowID)?.name ?? 'Workflow'}</h2><p className="muted">Started at {formatTime(selectedRun.startedAt)} · updated at {formatTime(selectedRun.updatedAt)}</p></div><StatusPill value={statusLabel(selectedRun.status)} tone={selectedRun.status === 'completed' ? 'success' : selectedRun.status === 'failed' ? 'danger' : 'accent'} /></div><div className="run-actions">{selectedRun.status === 'running' && <button className="button subtle" onClick={() => void api.pauseRun(selectedRun.id).then(() => announce('Pause requested.')).catch((error) => announce(errorText(error)))}>Pause</button>}{selectedRun.status === 'paused' && <button className="button primary" onClick={() => void api.resumeRun(selectedRun.id).then(() => announce('Run resumed.')).catch((error) => announce(errorText(error)))}>Resume</button>}{['running', 'paused', 'queued'].includes(selectedRun.status) && <button className="button danger-quiet" onClick={() => void api.cancelRun(selectedRun.id).then(() => announce('Cancellation requested.')).catch((error) => announce(errorText(error)))}>Cancel</button>}</div><div className="run-usage-summary" aria-label="Run token usage"><div><span>Prompt budget</span><strong>{(selectedRun.promptTokensUsed ?? 0).toLocaleString()} / {(selectedRun.promptTokenBudget ?? 0).toLocaleString()} est. tokens</strong></div><div><span>Output</span><strong>{(selectedRun.outputBytes ?? 0).toLocaleString()} bytes</strong></div></div><Timeline events={activeEvents} onOpenRuns={() => undefined} /></> : <div className="empty-state"><strong>Select a run</strong><span>The complete history is available here.</span></div>}</section></div></div>
+    <div className="view-stack"><div className="view-heading"><div><span className="section-kicker">History</span><h1>Runs</h1><p>Open a run to inspect steps, approvals, errors, and results.</p></div><button className="button primary" onClick={() => void startRun()} disabled={!selectedWorkflow || busy}>Run workflow</button></div><div className="runs-layout"><section className="run-list panel-card">{runs.map((run) => <button className={`run-list-item ${run.id === selectedRunID ? 'selected' : ''}`} key={run.id} onClick={() => setSelectedRunID(run.id)}><div><strong>{workflows.find((workflow) => workflow.id === run.workflowID)?.name ?? 'Workflow'}</strong><small>{run.id.slice(0, 12)} · {formatTime(run.startedAt)}</small></div><StatusPill value={statusLabel(run.status)} tone={runTone(run.status)} /></button>)}{runs.length === 0 && <div className="empty-state"><strong>No runs</strong><span>The first run will appear here.</span></div>}</section><section className="run-detail panel-card">{selectedRun ? <><div className="card-topline"><span className="eyebrow">Selected run</span><span className="mini-code">{selectedRun.id}</span></div><div className="run-detail-heading"><div><h2>{workflows.find((workflow) => workflow.id === selectedRun.workflowID)?.name ?? 'Workflow'}</h2><p className="muted">Started at {formatTime(selectedRun.startedAt)} · updated at {formatTime(selectedRun.updatedAt)}</p></div><StatusPill value={statusLabel(selectedRun.status)} tone={runTone(selectedRun.status)} /></div><div className="run-actions">{selectedRun.status === 'running' && <button className="button subtle" onClick={() => void api.pauseRun(selectedRun.id).then(() => announce('Pause requested.')).catch((error) => announce(errorText(error)))}>Pause</button>}{['paused', 'interrupted'].includes(selectedRun.status) && <button className="button primary" onClick={() => void api.resumeRun(selectedRun.id).then(() => announce('Run resumed.')).catch((error) => announce(errorText(error)))}>Resume</button>}{['running', 'paused', 'queued'].includes(selectedRun.status) && <button className="button danger-quiet" onClick={() => void api.cancelRun(selectedRun.id).then(() => announce('Cancellation requested.')).catch((error) => announce(errorText(error)))}>Cancel</button>}{['blocked', 'failed'].includes(selectedRun.status) && selectedRun.currentNodeID && <button className="button subtle" onClick={() => void api.retryStep(selectedRun.id, selectedRun.currentNodeID || '').then(() => announce('Blocked step retry started.')).catch((error) => announce(errorText(error)))}>Retry current step</button>}</div><div className="run-usage-summary" aria-label="Run token usage"><div><span>Prompt budget</span><strong>{(selectedRun.promptTokensUsed ?? 0).toLocaleString()} / {(selectedRun.promptTokenBudget ?? 0).toLocaleString()} est. tokens</strong></div><div><span>Output</span><strong>{(selectedRun.outputBytes ?? 0).toLocaleString()} bytes</strong></div></div><Timeline events={activeEvents} agents={agents} detailed onOpenRuns={() => undefined} /></> : <div className="empty-state"><strong>Select a run</strong><span>The complete history is available here.</span></div>}</section></div></div>
   )
 
   const renderSchedules = () => (
@@ -1996,8 +2842,54 @@ function App() {
   )
 }
 
-function Timeline({ events, onOpenRuns }: { events: RunEvent[]; onOpenRuns: () => void }) {
-  return <section className="timeline-panel panel-card"><div className="card-topline"><div><span className="eyebrow">Timeline</span><h2>Operational events</h2></div><button className="link-button" onClick={onOpenRuns}>view history →</button></div>{events.length === 0 ? <div className="timeline-empty"><span className="empty-line" /><span>Waiting for supervisor events.</span></div> : <div className="timeline-list">{events.slice(-7).reverse().map((event) => <div className="timeline-row" key={`${event.runID}-${event.sequence}`}><span className={`timeline-dot ${event.level}`} /><span className="timeline-time">{formatTime(event.timestamp)}</span><span className="timeline-type">{event.type}</span><span className="timeline-message">{event.message}</span><span className="timeline-source">{event.source}</span></div>)}</div>}</section>
+function Timeline({ events, agents = [], detailed = false, onOpenRuns }: { events: RunEvent[]; agents?: AgentProfile[]; detailed?: boolean; onOpenRuns: () => void }) {
+  const agentNames = new Map(agents.map((agent) => [agent.id, agent.name]))
+  const visibleEvents = (detailed ? events.slice(-200) : events.slice(-7)).reverse()
+  return <section className={`timeline-panel panel-card ${detailed ? 'timeline-panel-detailed' : ''}`}><div className="card-topline"><div><span className="eyebrow">Timeline</span><h2>{detailed ? 'Agent activity & run log' : 'Operational events'}</h2></div>{detailed ? <span className="timeline-count">{events.length} event{events.length === 1 ? '' : 's'}</span> : <button className="link-button" onClick={onOpenRuns}>view history →</button>}</div>{events.length === 0 ? <div className="timeline-empty"><span className="empty-line" /><span>Waiting for supervisor events.</span></div> : <div className="timeline-list">{visibleEvents.map((event) => { const agentName = event.agentID ? (agentNames.get(event.agentID) ?? event.agentID.slice(0, 12)) : 'Supervisor'; const detail = typeof event.data?.detail === 'string' ? event.data.detail : event.type === 'agent.output' && typeof event.data?.outputBytes === 'number' ? `${event.data.outputBytes.toLocaleString()} bytes returned` : ''; return <div className={`timeline-row ${detailed ? 'timeline-row-detailed' : ''}`} key={`${event.runID}-${event.sequence}`}><span className={`timeline-dot ${event.level}`} /><span className="timeline-time">{formatTime(event.timestamp)}</span>{detailed && <span className="timeline-agent">{agentName}</span>}{detailed && <span className="timeline-node">{event.nodeID ? `Node ${event.nodeID}` : 'Run'}</span>}<span className="timeline-type">{event.type}</span><span className="timeline-message">{event.message}{detail && <small className="timeline-detail">{detail}</small>}</span><span className="timeline-source">{event.source}</span></div>})}</div>}</section>
+}
+
+function AgentRunInspector({
+  agent,
+  run,
+  workflow,
+  step,
+  events,
+  onOpenProfile,
+  onOpenRuns,
+}: {
+  agent?: AgentProfile
+  run?: Run
+  workflow?: WorkflowDefinition
+  step?: RunStep
+  events: RunEvent[]
+  onOpenProfile: () => void
+  onOpenRuns: () => void
+}) {
+  if (!agent) {
+    return <div className="panel-card agent-run-inspector empty-small"><strong>Select an agent</strong><span>Click a person in the office to inspect its execution.</span></div>
+  }
+  const node = workflow?.nodes.find((candidate) => candidate.id === step?.nodeID)
+  const currentStatus = step?.status ?? agent.visualState ?? 'idle'
+  const tone = ['completed', 'success'].includes(currentStatus) ? 'success' : ['failed', 'error'].includes(currentStatus) ? 'danger' : ['waiting_approval', 'blocked'].includes(currentStatus) ? 'warning' : currentStatus === 'idle' ? 'neutral' : 'accent'
+  let outputText = ''
+  if (step?.output && Object.keys(step.output).length > 0) outputText = readableStructuredOutput(step.output)
+  if (outputText.length > 1400) outputText = `${outputText.slice(0, 1400)}\n…`
+  const latestEvent = events[0]
+  return <section className="panel-card agent-run-inspector" aria-label={`Execution inspector for ${agent.name}`}>
+    <div className="agent-inspector-heading"><AgentAvatar agent={agent} /><div><span className="eyebrow">Selected agent</span><h2>{agent.name}</h2><p>{agent.role}</p></div></div>
+    <div className="agent-inspector-status"><StatusPill value={step ? statusLabel(currentStatus) : (stateLabels[currentStatus] ?? currentStatus)} tone={tone} /><span>{run ? `Run ${run.id.slice(0, 8)}` : 'No run selected'}</span></div>
+    <div className="agent-inspector-grid">
+      <div><span>Stage</span><strong>{node?.label || node?.id || 'Not started'}</strong></div>
+      <div><span>Attempt</span><strong>{step ? `${step.attempt || 1}` : '—'}</strong></div>
+      <div><span>Thread</span><code>{step?.threadID ? step.threadID.slice(0, 14) : '—'}</code></div>
+      <div><span>Turn</span><code>{step?.turnID ? step.turnID.slice(0, 14) : '—'}</code></div>
+    </div>
+    {latestEvent && <div className="agent-inspector-event"><span>Latest activity</span><strong>{latestEvent.message || latestEvent.type}</strong><small>{formatTime(latestEvent.timestamp)} · {latestEvent.type}</small></div>}
+    {events.length > 0 && <details className="agent-inspector-log"><summary>Agent activity · {events.length} events</summary><div>{events.map((event) => <div className="agent-inspector-log-row" key={`${event.runID}-${event.sequence}`}><span>{formatTime(event.timestamp)}</span><strong>{event.type}</strong><small>{event.message}</small></div>)}</div></details>}
+    {step?.error && <div className="agent-inspector-error">{step.error}</div>}
+    {outputText && <details className="agent-inspector-output" open><summary>Latest result</summary><div className="agent-inspector-readable-output">{outputText}</div></details>}
+    <div className="agent-inspector-actions"><button className="button subtle small" onClick={onOpenProfile}>Open profile</button><button className="link-button" onClick={onOpenRuns}>Full run timeline →</button></div>
+  </section>
 }
 
 export default App

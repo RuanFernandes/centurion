@@ -58,6 +58,7 @@ export type SystemPrompt = {
 
 export type AgentProfile = {
   id: string
+  projectID?: string
   name: string
   role: string
   instructions: string
@@ -68,6 +69,7 @@ export type AgentProfile = {
   approvalProfile: string
   roomID: string
   avatarID: string
+  spriteID: string
   visualState: string
   maxDurationSeconds: number
   maxTurns: number
@@ -83,6 +85,8 @@ export type BuilderRequest = {
   threadID?: string
   modelID?: string
   reasoningEffort?: string
+  subagentApprovalProfile?: string
+  handoff?: boolean
 }
 
 export type PlanningRequest = {
@@ -119,6 +123,7 @@ export type BuilderAgentDraft = {
 export type BuilderProposal = {
   schemaVersion: number
   summary: string
+  executionBrief?: string
   notes?: string[]
   agents: BuilderAgentDraft[]
   workflow?: WorkflowDefinition | null
@@ -128,6 +133,41 @@ export type BuilderResponse = {
   threadID: string
   reply: string
   proposal: BuilderProposal
+}
+
+export type BuilderActivityEvent = {
+  schemaVersion: number
+  timestamp: string
+  sequence: number
+  source: string
+  scope: BuilderMode
+  threadID?: string
+  turnID?: string
+  state: 'working' | 'completed' | 'error' | string
+  activity: string
+  detail?: string
+}
+
+export type BuilderMode = 'planning' | 'building'
+
+export type BuilderStatus = {
+  schemaVersion: number
+  timestamp: string
+  sequence: number
+  source: string
+  requestID: string
+  projectID?: string
+  scope: BuilderMode | string
+  state: 'idle' | 'working' | 'completed' | 'error' | string
+  activity: string
+  detail?: string
+  threadID?: string
+  turnID?: string
+  startedAt: string
+  updatedAt: string
+  error?: string
+  planningResponse?: PlanningResponse
+  builderResponse?: BuilderResponse
 }
 
 export type BuilderApplyRequest = {
@@ -151,6 +191,26 @@ export type Project = {
   lastOpenedAt?: string
 }
 
+export type LearnSystemRequest = {
+  projectID?: string
+  modelID?: string
+  reasoningEffort?: string
+}
+
+export type LearnSystemResult = {
+  projectID: string
+  status: string
+  primaryFolder: string
+  docsPath: string
+  docsFiles: string[]
+  missingFiles?: string[]
+  modelID?: string
+  reasoningEffort?: string
+  threadID?: string
+  summary?: string
+  durationMs: number
+}
+
 export type RetryPolicy = {
   maxAttempts: number
   backoffSeconds: number
@@ -162,6 +222,7 @@ export type WorkflowNode = {
   type: string
   label: string
   agentID?: string
+  prompt?: string
   condition?: string
   toolName?: string
   artifactPath?: string
@@ -183,6 +244,7 @@ export type WorkflowDefinition = {
   name: string
   version: number
   description?: string
+  executionBrief?: string
   entryNodeID: string
   nodes: WorkflowNode[]
   edges: WorkflowEdge[]
@@ -217,6 +279,19 @@ export type Run = {
   promptTokensUsed?: number
   promptTokenBudget?: number
   outputBytes?: number
+}
+
+export type RunStep = {
+  runID: string
+  nodeID: string
+  status: string
+  attempt: number
+  threadID?: string
+  turnID?: string
+  output?: JsonMap
+  error?: string
+  startedAt?: string
+  completedAt?: string
 }
 
 export type AuditEntry = {
@@ -328,6 +403,7 @@ export const defaultAgent: AgentProfile = {
   approvalProfile: 'on_request',
   roomID: 'workshop',
   avatarID: 'operator',
+  spriteID: '',
   visualState: 'idle',
   maxDurationSeconds: 1800,
   maxTurns: 12,
@@ -335,6 +411,42 @@ export const defaultAgent: AgentProfile = {
   memorySummary: '',
   createdAt: '',
   updatedAt: '',
+}
+
+// Agent data can come from older project manifests or from optional fields in
+// a Builder proposal. Normalize it before rendering so the editor never has
+// to trust nullable JSON arrays from the native bridge.
+export function normalizeAgent(value: unknown): AgentProfile {
+  const source = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const text = (key: string, fallback: string) => typeof source[key] === 'string' ? source[key] as string : fallback
+  const list = (key: string) => Array.isArray(source[key])
+    ? (source[key] as unknown[]).filter((item): item is string => typeof item === 'string')
+    : []
+  const number = (key: string, fallback: number) => typeof source[key] === 'number' && Number.isFinite(source[key]) ? source[key] as number : fallback
+
+  return {
+    ...defaultAgent,
+    id: text('id', ''),
+    projectID: text('projectID', '') || undefined,
+    name: text('name', defaultAgent.name),
+    role: text('role', defaultAgent.role),
+    instructions: text('instructions', defaultAgent.instructions),
+    modelID: text('modelID', ''),
+    reasoningEffort: text('reasoningEffort', ''),
+    workspaceRoots: list('workspaceRoots'),
+    toolAllowlist: list('toolAllowlist'),
+    approvalProfile: text('approvalProfile', defaultAgent.approvalProfile),
+    roomID: text('roomID', defaultAgent.roomID),
+    avatarID: text('avatarID', defaultAgent.avatarID),
+    spriteID: text('spriteID', ''),
+    visualState: text('visualState', defaultAgent.visualState),
+    maxDurationSeconds: number('maxDurationSeconds', defaultAgent.maxDurationSeconds),
+    maxTurns: number('maxTurns', defaultAgent.maxTurns),
+    maxAttempts: number('maxAttempts', defaultAgent.maxAttempts),
+    memorySummary: text('memorySummary', ''),
+    createdAt: text('createdAt', ''),
+    updatedAt: text('updatedAt', ''),
+  }
 }
 
 export const defaultProject: Project = {

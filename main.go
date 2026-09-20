@@ -19,6 +19,9 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
+//go:embed build/appicon.png
+var trayIcon []byte
+
 func init() {
 	application.RegisterEvent[model.AuthState]("auth.updated")
 	application.RegisterEvent[model.ModelsUpdatedEvent]("models.updated")
@@ -32,6 +35,7 @@ func init() {
 	application.RegisterEvent[model.AgentStateEvent]("office.agent.state")
 	application.RegisterEvent[model.Project]("project.updated")
 	application.RegisterEvent[model.CodexNotification]("codex.notification")
+	application.RegisterEvent[model.BuilderActivityEvent]("builder.activity")
 }
 
 func main() {
@@ -80,8 +84,21 @@ func main() {
 		},
 	})
 
+	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
+		Title:            "Centurion · Agent Command Center",
+		Width:            1440,
+		Height:           900,
+		MinWidth:         1080,
+		MinHeight:        680,
+		Frameless:        true,
+		BackgroundColour: application.NewRGB(9, 12, 20),
+		URL:              "/",
+	})
+	tray := newTrayController(app, window, dataStore, trayIcon)
+
 	service.setApp(app)
 	service.setEmitter(func(name string, payload any) {
+		tray.updateFromEvent(name, payload)
 		app.Event.Emit(name, payload)
 	})
 	go service.Connect(context.Background())
@@ -92,17 +109,6 @@ func main() {
 	} else {
 		log.Printf("scheduler IPC unavailable: %v", ipcErr)
 	}
-
-	app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:            "Centurion · Agent Command Center",
-		Width:            1440,
-		Height:           900,
-		MinWidth:         1080,
-		MinHeight:        680,
-		Frameless:        true,
-		BackgroundColour: application.NewRGB(9, 12, 20),
-		URL:              "/",
-	})
 
 	if err := app.Run(); err != nil {
 		service.Close()
@@ -169,7 +175,7 @@ func runScheduled(dataStore *store.Store, service *AppService, scheduleID string
 			break
 		}
 		switch current.Status {
-		case model.RunStatusCompleted, model.RunStatusFailed, model.RunStatusCanceled, model.RunStatusInterrupted:
+		case model.RunStatusCompleted, model.RunStatusBlocked, model.RunStatusFailed, model.RunStatusCanceled, model.RunStatusInterrupted:
 			log.Printf("scheduled run finished: %s", current.Status)
 			service.Close()
 			return

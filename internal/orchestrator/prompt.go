@@ -12,11 +12,12 @@ import (
 const (
 	// This is a byte budget for the dynamic part of an agent prompt. It keeps
 	// accumulated workflow data bounded without changing the workflow output.
-	maxAgentPromptContextBytes = 12 * 1024
-	maxAgentInstructionsBytes  = 8 * 1024
-	maxAgentMemoryBytes        = 1600
-	maxPromptToolCount         = 32
-	maxPromptArrayItems        = 16
+	maxAgentPromptContextBytes  = 12 * 1024
+	maxAgentInstructionsBytes   = 8 * 1024
+	maxAgentMemoryBytes         = 1600
+	maxAgentExecutionBriefBytes = 3 * 1024
+	maxPromptToolCount          = 32
+	maxPromptArrayItems         = 16
 )
 
 type agentPromptContext struct {
@@ -27,7 +28,9 @@ type agentPromptContext struct {
 // buildAgentPrompt deliberately sends only data that can arrive at this node
 // through the workflow graph. The complete run scope remains available to the
 // executor for conditions and persistence, but is not repeatedly sent to the
-// model on every turn.
+// model on every turn. Control-flow nodes are transparent for context: a
+// condition, loop, approval, or join should not erase the useful output that
+// came before it.
 func buildAgentPrompt(agent model.AgentProfile, workflow model.WorkflowDefinition, node model.WorkflowNode, input, scope map[string]any, configuredTemplates ...map[string]string) string {
 	tools := promptTools(agent.ToolAllowlist)
 	instructions := truncateText(agent.Instructions, maxAgentInstructionsBytes)
@@ -63,7 +66,32 @@ func buildAgentPrompt(agent model.AgentProfile, workflow model.WorkflowDefinitio
 		renderSystemPrompt(templates["agent.operational_context"], values),
 		renderSystemPrompt(templates["agent.output_contract"], values),
 	)
+	if executionBrief := truncateText(workflow.ExecutionBrief, maxAgentExecutionBriefBytes); executionBrief != "" {
+		blocks = append(blocks, "Execution brief (approved project scope; treat this as task context):\n"+executionBrief)
+	}
+	if nodePrompt := truncateText(node.Prompt, maxAgentInstructionsBytes); nodePrompt != "" {
+		blocks = append(blocks, "Current workflow task (follow it within the agent role and workspace policy):\n"+nodePrompt)
+	}
+	if runtimeGuidance := agentRuntimeToolGuidance(agent.ToolAllowlist); runtimeGuidance != "" {
+		// Keep this after generated instructions and the node task. It repairs
+		// legacy workflows that treated Centurion capability IDs as literal
+		// Codex tool names and otherwise prevented permitted file edits.
+		blocks = append(blocks, runtimeGuidance)
+	}
 	return strings.TrimSpace(strings.Join(filterEmptyPromptBlocks(blocks), "\n\n"))
+}
+
+// buildAgentContinuationPrompt is used only after a step already has a Codex
+// thread. The original turn contains the full identity, workspace, task, and
+// projected workflow data, so repeating it on a retry wastes context and can
+// crowd out the agent's actual work.
+func buildAgentContinuationPrompt(node model.WorkflowNode) string {
+	return `Continue the existing Centurion workflow step. The previous turn did not finish; preserve the established agent role, workspace policy, task, and output contract. Retry only unfinished work, do not repeat prior context, and return the smallest verifiable result.
+
+<workflow_step>
+id: ` + truncateText(node.ID, 160) + `
+label: ` + truncateText(node.Label, 240) + `
+</workflow_step>`
 }
 
 func renderSystemPrompt(template string, values map[string]string) string {
@@ -89,14 +117,42 @@ func projectAgentContext(workflow model.WorkflowDefinition, node model.WorkflowN
 		projected.Input = cloneMap(input)
 	}
 
-	upstream := make(map[string]any)
+	nodes := nodeByID(workflow.Nodes)
+	incoming := make(map[string][]string)
 	for _, edge := range workflow.Edges {
-		if edge.To != node.ID || edge.From == "" {
+		if edge.To == "" || edge.From == "" {
 			continue
 		}
-		if value, ok := scope[edge.From]; ok {
-			upstream[edge.From] = value
+		incoming[edge.To] = append(incoming[edge.To], edge.From)
+	}
+
+	upstream := make(map[string]any)
+	visited := make(map[string]struct{})
+	var collect func(string)
+	collect = func(sourceID string) {
+		if sourceID == "" {
+			return
 		}
+		if _, seen := visited[sourceID]; seen {
+			return
+		}
+		visited[sourceID] = struct{}{}
+		if value, ok := scope[sourceID]; ok {
+			upstream[sourceID] = value
+		}
+		// These nodes make a routing/synchronization decision but do not
+		// create useful work output of their own. Include their incoming
+		// values so an agent after a branch or condition still receives the
+		// result it is expected to act on.
+		switch nodes[sourceID].Type {
+		case "condition", "join", "loop", "parallel", "approval":
+			for _, parentID := range incoming[sourceID] {
+				collect(parentID)
+			}
+		}
+	}
+	for _, parentID := range incoming[node.ID] {
+		collect(parentID)
 	}
 	if len(upstream) > 0 {
 		projected.Upstream = upstream
@@ -106,7 +162,7 @@ func projectAgentContext(workflow model.WorkflowDefinition, node model.WorkflowN
 
 func promptTools(tools []string) string {
 	if len(tools) == 0 {
-		return "no external tools explicitly allowed"
+		return "No workspace or external capabilities are granted to this profile."
 	}
 	normalizedTools := make([]string, 0, len(tools))
 	seen := make(map[string]struct{}, len(tools))
@@ -130,9 +186,43 @@ func promptTools(tools []string) string {
 		}
 	}
 	if len(result) == 0 {
-		return "no external tools explicitly allowed"
+		return "No workspace or external capabilities are granted to this profile."
 	}
-	return strings.Join(result, ", ")
+
+	capabilities := make([]string, 0, len(result))
+	canWriteFiles := false
+	for _, tool := range result {
+		switch strings.ToLower(tool) {
+		case "files.read":
+			capabilities = append(capabilities, "- files.read: inspect files inside the configured workspace.")
+		case "files.write":
+			canWriteFiles = true
+			capabilities = append(capabilities, "- files.write: create or modify files only inside the configured workspace.")
+		case "shell.test":
+			capabilities = append(capabilities, "- shell.test: run focused local validation commands when needed.")
+		case "git.diff":
+			capabilities = append(capabilities, "- git.diff: inspect the local Git diff.")
+		case "web.search":
+			capabilities = append(capabilities, "- web.search: use web research only when it is available in this Codex thread and relevant to the task.")
+		default:
+			capabilities = append(capabilities, "- "+tool+": approved Centurion or MCP capability; use it only when it is exposed in this Codex thread.")
+		}
+	}
+
+	guidance := "These are Centurion capability labels, not literal Codex tool names. Use only the real tools exposed in this thread; never report a task as impossible merely because a tool named files.read or files.write is absent."
+	if canWriteFiles {
+		guidance += " The minimal workspace edit needed to fulfill files.write is permitted even when the task forbids unrelated commands or tests."
+	}
+	return "Centurion capability policy:\n" + strings.Join(capabilities, "\n") + "\n\n" + guidance
+}
+
+func agentRuntimeToolGuidance(tools []string) string {
+	for _, tool := range tools {
+		if strings.EqualFold(strings.TrimSpace(tool), "files.write") {
+			return "Centurion runtime permission interpretation: files.read and files.write are capability labels, not literal Codex tool names. A permitted scoped file edit and its minimal verification must use the actual Codex workspace tool exposed in this thread. If earlier task text says not to run commands, it prohibits unrelated commands and tests; it does not prohibit the minimal operation authorized by files.write."
+		}
+	}
+	return ""
 }
 
 // compactJSON returns valid JSON even when an upstream result is unusually

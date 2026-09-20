@@ -13,6 +13,23 @@ var allowedNodeTypes = map[string]struct{}{
 	"agent": {}, "condition": {}, "parallel": {}, "join": {}, "loop": {}, "approval": {}, "tool": {}, "artifact": {},
 }
 
+const (
+	maxWorkflowDurationSeconds = 7 * 24 * 60 * 60
+	maxWorkflowParallel        = 16
+	maxWorkflowTurns           = 200
+	maxNodeTimeoutSeconds      = 24 * 60 * 60
+	maxRetryAttempts           = 10
+	maxRetryBackoffSeconds     = 300
+	maxLoopIterations          = 1000
+)
+
+var allowedErrorPolicies = map[string]struct{}{
+	"stop":             {},
+	"continue":         {},
+	"fallback":         {},
+	"request_approval": {},
+}
+
 func ValidateWorkflow(workflow model.WorkflowDefinition) model.WorkflowValidation {
 	validation := model.WorkflowValidation{Valid: true}
 	if strings.TrimSpace(workflow.ID) == "" {
@@ -26,17 +43,29 @@ func ValidateWorkflow(workflow model.WorkflowDefinition) model.WorkflowValidatio
 	}
 	if workflow.GlobalLimits.MaxDurationSeconds <= 0 {
 		addError(&validation, "workflow.limit.duration", "globalLimits.maxDurationSeconds", "maxDurationSeconds must be greater than zero")
+	} else if workflow.GlobalLimits.MaxDurationSeconds > maxWorkflowDurationSeconds {
+		addError(&validation, "workflow.limit.duration.max", "globalLimits.maxDurationSeconds", fmt.Sprintf("maxDurationSeconds cannot exceed %d", maxWorkflowDurationSeconds))
 	}
 	if workflow.GlobalLimits.MaxParallel <= 0 {
 		addError(&validation, "workflow.limit.parallel", "globalLimits.maxParallel", "maxParallel must be greater than zero")
+	} else if workflow.GlobalLimits.MaxParallel > maxWorkflowParallel {
+		addError(&validation, "workflow.limit.parallel.max", "globalLimits.maxParallel", fmt.Sprintf("maxParallel cannot exceed %d", maxWorkflowParallel))
 	}
 	if workflow.GlobalLimits.MaxTurns <= 0 {
 		addError(&validation, "workflow.limit.turns", "globalLimits.maxTurns", "maxTurns must be greater than zero")
+	} else if workflow.GlobalLimits.MaxTurns > maxWorkflowTurns {
+		addError(&validation, "workflow.limit.turns.max", "globalLimits.maxTurns", fmt.Sprintf("maxTurns cannot exceed %d", maxWorkflowTurns))
 	}
 	if workflow.GlobalLimits.MaxPromptTokens < 0 || workflow.GlobalLimits.MaxPromptTokens > 1_000_000 {
 		addError(&validation, "workflow.limit.prompt_tokens", "globalLimits.maxPromptTokens", "maxPromptTokens must be between zero and one million")
 	} else if workflow.GlobalLimits.MaxPromptTokens == 0 {
 		addWarning(&validation, "workflow.limit.prompt_tokens.defaulted", "globalLimits.maxPromptTokens", "maxPromptTokens is zero and will default to 12000 estimated tokens")
+	}
+	policy := strings.ToLower(strings.TrimSpace(workflow.ErrorPolicy))
+	if policy == "" {
+		addWarning(&validation, "workflow.error_policy.defaulted", "errorPolicy", "errorPolicy is empty and will default to stop")
+	} else if _, ok := allowedErrorPolicies[policy]; !ok {
+		addError(&validation, "workflow.error_policy.invalid", "errorPolicy", "errorPolicy must be stop, continue, fallback, or request_approval")
 	}
 
 	nodes := make(map[string]model.WorkflowNode, len(workflow.Nodes))
@@ -56,15 +85,33 @@ func ValidateWorkflow(workflow model.WorkflowDefinition) model.WorkflowValidatio
 		}
 		if node.TimeoutSeconds < 0 {
 			addError(&validation, "node.timeout.invalid", path+".timeoutSeconds", "timeoutSeconds cannot be negative")
+		} else if node.TimeoutSeconds > maxNodeTimeoutSeconds {
+			addError(&validation, "node.timeout.max", path+".timeoutSeconds", fmt.Sprintf("timeoutSeconds cannot exceed %d", maxNodeTimeoutSeconds))
 		}
 		if node.Retry.MaxAttempts < 0 || node.Retry.BackoffSeconds < 0 {
 			addError(&validation, "node.retry.invalid", path+".retry", "retry limits cannot be negative")
+		}
+		if node.Retry.MaxAttempts > maxRetryAttempts {
+			addError(&validation, "node.retry.attempts.max", path+".retry.maxAttempts", fmt.Sprintf("maxAttempts cannot exceed %d", maxRetryAttempts))
+		}
+		if node.Retry.BackoffSeconds > maxRetryBackoffSeconds {
+			addError(&validation, "node.retry.backoff.max", path+".retry.backoffSeconds", fmt.Sprintf("backoffSeconds cannot exceed %d", maxRetryBackoffSeconds))
 		}
 		if node.Retry.MaxAttempts == 0 {
 			addWarning(&validation, "node.retry.defaulted", path+".retry.maxAttempts", "maxAttempts is zero and will default to one attempt")
 		}
 		if node.Type == "loop" && node.MaxIterations <= 0 {
 			addError(&validation, "loop.limit.required", path+".maxIterations", "loop nodes require maxIterations greater than zero")
+		} else if node.Type == "loop" && node.MaxIterations > maxLoopIterations {
+			addError(&validation, "loop.limit.max", path+".maxIterations", fmt.Sprintf("maxIterations cannot exceed %d", maxLoopIterations))
+		}
+		if policy == "fallback" {
+			fallback, ok := node.Config["fallbackNodeID"].(string)
+			if !ok || strings.TrimSpace(fallback) == "" {
+				addWarning(&validation, "workflow.fallback.target.missing", path+".config.fallbackNodeID", "this node has no fallbackNodeID and will fail the run if it errors")
+			} else if fallback == node.ID {
+				addError(&validation, "workflow.fallback.target.self", path+".config.fallbackNodeID", "fallbackNodeID cannot reference the same node")
+			}
 		}
 		if node.Type == "agent" && strings.TrimSpace(node.AgentID) == "" {
 			addError(&validation, "agent.id.required", path+".agentID", "agent nodes require an agentID")
@@ -84,12 +131,20 @@ func ValidateWorkflow(workflow model.WorkflowDefinition) model.WorkflowValidatio
 	if _, ok := nodes[workflow.EntryNodeID]; !ok {
 		addError(&validation, "entry.invalid", "entryNodeID", "entryNodeID must reference an existing node")
 	}
+	if len(nodes) > 1 && len(workflow.Edges) == 0 {
+		addError(&validation, "workflow.graph.disconnected", "edges", "workflows with multiple nodes require at least one connection")
+	}
 
 	adjacency := make(map[string][]string, len(nodes))
+	edgeIDs := make(map[string]struct{}, len(workflow.Edges))
 	for index, edge := range workflow.Edges {
 		path := fmt.Sprintf("edges[%d]", index)
 		if strings.TrimSpace(edge.ID) == "" {
 			addError(&validation, "edge.id.required", path+".id", "edge id is required")
+		} else if _, exists := edgeIDs[edge.ID]; exists {
+			addError(&validation, "edge.id.duplicate", path+".id", "edge id must be unique")
+		} else {
+			edgeIDs[edge.ID] = struct{}{}
 		}
 		if _, ok := nodes[edge.From]; !ok {
 			addError(&validation, "edge.from.invalid", path+".from", "edge source does not exist")
@@ -109,7 +164,7 @@ func ValidateWorkflow(workflow model.WorkflowDefinition) model.WorkflowValidatio
 	}
 	for _, node := range workflow.Nodes {
 		if node.Type == "parallel" && len(adjacency[node.ID]) < 2 {
-			addWarning(&validation, "parallel.single.branch", "nodes["+node.ID+"]", "parallel nodes should have at least two outgoing branches")
+			addError(&validation, "parallel.single.branch", "nodes["+node.ID+"]", "parallel nodes require at least two outgoing branches")
 		}
 		if node.Type == "condition" && len(adjacency[node.ID]) < 2 {
 			addWarning(&validation, "condition.single.branch", "nodes["+node.ID+"]", "condition nodes normally need at least two outgoing edges")
@@ -119,14 +174,22 @@ func ValidateWorkflow(workflow model.WorkflowDefinition) model.WorkflowValidatio
 				addError(&validation, "loop.exhausted.invalid", "nodes["+node.ID+"] .config.onExhausted", "loop exhaustion target does not exist")
 			}
 		}
+		if policy == "fallback" {
+			if target, ok := node.Config["fallbackNodeID"].(string); ok {
+				if _, exists := nodes[target]; !exists {
+					addError(&validation, "workflow.fallback.target.invalid", "nodes["+node.ID+"] .config.fallbackNodeID", "fallback target does not exist")
+				}
+			}
+		}
 	}
+	validateParallelNesting(nodes, adjacency, &validation)
 
 	if workflow.EntryNodeID != "" {
 		reachable := make(map[string]bool)
 		visitReachable(workflow.EntryNodeID, adjacency, reachable)
 		for id := range nodes {
 			if !reachable[id] {
-				addWarning(&validation, "node.unreachable", "nodes["+id+"]", "node is not reachable from entryNodeID")
+				addError(&validation, "node.unreachable", "nodes["+id+"]", "node is not reachable from entryNodeID")
 			}
 		}
 	}
@@ -362,6 +425,51 @@ func visitReachable(id string, adjacency map[string][]string, visited map[string
 	for _, next := range adjacency[id] {
 		visitReachable(next, adjacency, visited)
 	}
+}
+
+// The first executor keeps one semaphore per top-level parallel node. A
+// nested parallel would require a second scheduling scope and could otherwise
+// deadlock or exceed the configured parallelism. Reject it during validation
+// so a saved workflow cannot fail only after execution has started.
+func validateParallelNesting(nodes map[string]model.WorkflowNode, adjacency map[string][]string, validation *model.WorkflowValidation) {
+	for rootID, root := range nodes {
+		if root.Type != "parallel" {
+			continue
+		}
+		visited := make(map[string]struct{})
+		for _, branchID := range adjacency[rootID] {
+			if containsNestedParallel(branchID, nodes, adjacency, visited) {
+				addError(validation, "parallel.nested.unsupported", "nodes["+rootID+"]", "nested parallel nodes are not supported; connect branches to a join before starting another parallel block")
+				break
+			}
+		}
+	}
+}
+
+func containsNestedParallel(id string, nodes map[string]model.WorkflowNode, adjacency map[string][]string, visited map[string]struct{}) bool {
+	if id == "" {
+		return false
+	}
+	if _, seen := visited[id]; seen {
+		return false
+	}
+	visited[id] = struct{}{}
+	node, exists := nodes[id]
+	if !exists {
+		return false
+	}
+	if node.Type == "join" {
+		return false
+	}
+	if node.Type == "parallel" {
+		return true
+	}
+	for _, next := range adjacency[id] {
+		if containsNestedParallel(next, nodes, adjacency, visited) {
+			return true
+		}
+	}
+	return false
 }
 
 func nodeType(nodes map[string]model.WorkflowNode, id string) string { return nodes[id].Type }

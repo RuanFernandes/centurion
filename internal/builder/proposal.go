@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -13,11 +14,21 @@ import (
 )
 
 const (
-	MaxRequestBytes  = 8 * 1024
-	MaxOutputBytes   = 128 * 1024
-	MaxAgents        = 24
-	MaxWorkflowNodes = 64
-	MaxWorkflowEdges = 128
+	// MaxRequestBytes protects direct Builder messages from accidentally
+	// receiving an unbounded payload. Keep it aligned with the Planner handoff
+	// limit so a long, user-authored implementation brief is not rejected just
+	// because it was entered directly in Build mode.
+	MaxRequestBytes         = 64 * 1024
+	MaxPlanningMessageBytes = 64 * 1024
+	MaxHandoffMessageBytes  = 64 * 1024
+	MaxOutputBytes          = 128 * 1024
+	// Execution briefs are included in the initial prompt for every workflow
+	// agent. Keep them intentionally compact; node prompts carry each step's
+	// detailed instructions.
+	MaxExecutionBriefBytes = 3 * 1024
+	MaxAgents              = 24
+	MaxWorkflowNodes       = 64
+	MaxWorkflowEdges       = 128
 )
 
 type Catalog struct {
@@ -25,10 +36,31 @@ type Catalog struct {
 	MCPServers []model.MCPServer
 }
 
+// ApplyExecutionBrief persists the Builder's compact objective with the
+// workflow. A raw Builder request can contain an entire planning transcript,
+// so it is only a last-resort fallback; otherwise every runtime agent would
+// receive that transcript again.
+func ApplyExecutionBrief(proposal model.BuilderProposal, prompt string) model.BuilderProposal {
+	briefSource := proposal.ExecutionBrief
+	if strings.TrimSpace(briefSource) == "" && proposal.Workflow != nil {
+		briefSource = proposal.Workflow.ExecutionBrief
+	}
+	fallback := boundedText(proposal.Summary, boundedText(prompt, "", MaxExecutionBriefBytes), MaxExecutionBriefBytes)
+	brief := boundedText(briefSource, fallback, MaxExecutionBriefBytes)
+	proposal.ExecutionBrief = brief
+	if proposal.Workflow != nil {
+		proposal.Workflow.ExecutionBrief = brief
+	}
+	return proposal
+}
+
 var allowedNodeTypes = map[string]struct{}{
 	"agent": {}, "condition": {}, "parallel": {}, "join": {}, "loop": {}, "approval": {}, "tool": {}, "artifact": {},
 }
 
+// builtInPermissions are Centurion capability IDs. They are deliberately not
+// App Server method or Codex tool names; the executor maps file-write access
+// to its sandbox and the prompt explains how agents use actual exposed tools.
 var builtInPermissions = map[string]struct{}{
 	"files.read":  {},
 	"files.write": {},
@@ -41,7 +73,7 @@ func OutputSchema() map[string]any {
 	return map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
-		"required":             []string{"schemaVersion", "summary", "agents", "workflow"},
+		"required":             []string{"schemaVersion", "summary", "notes", "agents", "workflow"},
 		"properties": map[string]any{
 			"schemaVersion": map[string]any{"type": "integer"},
 			"summary":       map[string]any{"type": "string"},
@@ -55,7 +87,7 @@ func OutputSchema() map[string]any {
 				"items": map[string]any{
 					"type":                 "object",
 					"additionalProperties": false,
-					"required":             []string{"temporaryID", "name", "role", "instructions", "approvalProfile"},
+					"required":             []string{"temporaryID", "name", "role", "instructions", "modelID", "reasoningEffort", "workspaceRoots", "toolAllowlist", "approvalProfile", "roomID", "avatarID", "maxDurationSeconds", "maxTurns", "maxAttempts"},
 					"properties": map[string]any{
 						"temporaryID":        map[string]any{"type": "string"},
 						"name":               map[string]any{"type": "string"},
@@ -99,15 +131,337 @@ func ParseProposal(output string) (model.BuilderProposal, error) {
 		return model.BuilderProposal{}, errors.New("Codex builder did not return a JSON proposal")
 	}
 	var proposal model.BuilderProposal
-	if err := json.Unmarshal([]byte(cleaned[start:end+1]), &proposal); err != nil {
+	proposalJSON := []byte(cleaned[start : end+1])
+	proposalJSON, err := normalizeSchemaVersionJSON(proposalJSON)
+	if err != nil {
+		return model.BuilderProposal{}, err
+	}
+	if err := json.Unmarshal(proposalJSON, &proposal); err != nil {
 		return model.BuilderProposal{}, fmt.Errorf("decode Codex builder proposal: %w", err)
 	}
+	applyAgentFieldAliases(&proposal, proposalJSON)
+	if proposal.Workflow != nil && len(proposal.Workflow.Edges) == 0 {
+		proposal.Workflow.Edges = parseWorkflowConnectionAliases(proposalJSON)
+	}
 	return proposal, nil
+}
+
+// normalizeSchemaVersionJSON accepts the common LLM variant
+// {"schemaVersion":"1"}. The persisted contract remains numeric and later
+// normalization still owns the accepted schema version.
+func normalizeSchemaVersionJSON(raw []byte) ([]byte, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("decode Codex builder proposal: %w", err)
+	}
+	value, ok := envelope["schemaVersion"]
+	if !ok {
+		return raw, nil
+	}
+	var stringVersion string
+	if err := json.Unmarshal(value, &stringVersion); err != nil {
+		return raw, nil
+	}
+	version, err := strconv.Atoi(strings.TrimSpace(stringVersion))
+	if err != nil {
+		return nil, fmt.Errorf("decode Codex builder proposal: schemaVersion must be an integer, got %q", stringVersion)
+	}
+	envelope["schemaVersion"] = json.RawMessage(strconv.AppendInt(nil, int64(version), 10))
+	normalized, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("normalize Codex builder proposal: %w", err)
+	}
+	return normalized, nil
+}
+
+// applyAgentFieldAliases keeps proposals produced by older Builder prompts
+// compatible with the canonical model. The aliases are accepted only while
+// parsing the external proposal; persisted profiles always use the current
+// field names and validation rules.
+func applyAgentFieldAliases(proposal *model.BuilderProposal, raw []byte) {
+	if proposal == nil {
+		return
+	}
+	var envelope struct {
+		Agents []json.RawMessage `json:"agents"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil {
+		return
+	}
+	for index := range proposal.Agents {
+		if index >= len(envelope.Agents) {
+			break
+		}
+		var aliases struct {
+			Model       string   `json:"model"`
+			Prompt      string   `json:"prompt"`
+			Permissions []string `json:"permissions"`
+			MCPTools    []string `json:"mcpTools"`
+			Role        string   `json:"role"`
+		}
+		if json.Unmarshal(envelope.Agents[index], &aliases) != nil {
+			continue
+		}
+		agent := &proposal.Agents[index]
+		if strings.TrimSpace(agent.ModelID) == "" {
+			agent.ModelID = strings.TrimSpace(aliases.Model)
+		}
+		if strings.TrimSpace(agent.Instructions) == "" {
+			agent.Instructions = strings.TrimSpace(aliases.Prompt)
+		}
+		if strings.TrimSpace(agent.Role) == "" {
+			agent.Role = firstNonEmptyAgentRole(aliases.Role, agent.AvatarID)
+		}
+		agent.ToolAllowlist = appendUniqueStrings(agent.ToolAllowlist, aliases.Permissions...)
+		agent.ToolAllowlist = appendUniqueStrings(agent.ToolAllowlist, aliases.MCPTools...)
+	}
+}
+
+func firstNonEmptyAgentRole(role, avatarID string) string {
+	if strings.TrimSpace(role) != "" {
+		return strings.TrimSpace(role)
+	}
+	switch strings.ToLower(strings.TrimSpace(avatarID)) {
+	case "supervisor":
+		return "Operations supervisor"
+	case "researcher":
+		return "Researcher"
+	case "reviewer":
+		return "Quality reviewer"
+	case "builder":
+		return "Software implementer"
+	default:
+		return ""
+	}
+}
+
+func appendUniqueStrings(values []string, additions ...string) []string {
+	result := append([]string(nil), values...)
+	seen := make(map[string]struct{}, len(result)+len(additions))
+	for index := range result {
+		result[index] = strings.TrimSpace(result[index])
+		if result[index] != "" {
+			seen[strings.ToLower(result[index])] = struct{}{}
+		}
+	}
+	for _, value := range additions {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+// parseWorkflowConnectionAliases keeps the Builder tolerant of the two terms
+// models commonly use for the same graph concept. The canonical persisted
+// field remains workflow.edges; connections and links are accepted only at
+// the proposal boundary.
+func parseWorkflowConnectionAliases(raw []byte) []model.WorkflowEdge {
+	var envelope struct {
+		Workflow json.RawMessage `json:"workflow"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil || len(envelope.Workflow) == 0 || string(envelope.Workflow) == "null" {
+		return nil
+	}
+	var workflow map[string]json.RawMessage
+	if err := json.Unmarshal(envelope.Workflow, &workflow); err != nil {
+		return nil
+	}
+	for _, key := range []string{"connections", "links"} {
+		if encoded, ok := workflow[key]; ok {
+			if edges := decodeWorkflowConnections(encoded); len(edges) > 0 {
+				return edges
+			}
+		}
+	}
+	// Some Builder responses describe a linear or branching route as a
+	// `next` field on each node instead of emitting the canonical edges array.
+	// Convert that compatibility form at the proposal boundary so the
+	// persisted workflow and executor always use one graph representation.
+	encodedNodes, ok := workflow["nodes"]
+	if !ok {
+		return nil
+	}
+	var nodes []map[string]json.RawMessage
+	if json.Unmarshal(encodedNodes, &nodes) != nil {
+		return nil
+	}
+	edges := make([]model.WorkflowEdge, 0)
+	seen := make(map[string]struct{})
+	for _, node := range nodes {
+		from := connectionString(node, "id", "nodeID")
+		if from == "" {
+			continue
+		}
+		for _, key := range []string{"next", "nextNodeID", "nextNodeIDs"} {
+			next, exists := node[key]
+			if !exists {
+				continue
+			}
+			for _, target := range decodeNodeNextTargets(next) {
+				to := connectionNodeIDFromRaw(target.raw)
+				if to == "" || to == from {
+					continue
+				}
+				condition := connectionString(target.object, "condition", "when", "expression")
+				key := from + "\x00" + to + "\x00" + condition
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				edges = append(edges, model.WorkflowEdge{ID: fmt.Sprintf("edge-next-%d", len(edges)+1), From: from, To: to, Condition: condition})
+			}
+		}
+	}
+	return edges
+}
+
+type nodeNextTarget struct {
+	raw    json.RawMessage
+	object map[string]json.RawMessage
+}
+
+func decodeNodeNextTargets(raw json.RawMessage) []nodeNextTarget {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var values []json.RawMessage
+	if json.Unmarshal(raw, &values) != nil {
+		values = []json.RawMessage{raw}
+	}
+	result := make([]nodeNextTarget, 0, len(values))
+	for _, value := range values {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(value, &object) != nil {
+			object = nil
+		}
+		result = append(result, nodeNextTarget{raw: value, object: object})
+	}
+	return result
+}
+
+func decodeWorkflowConnections(raw json.RawMessage) []model.WorkflowEdge {
+	result := make([]model.WorkflowEdge, 0)
+	seen := make(map[string]struct{})
+	appendEdge := func(id, from, to, condition string) {
+		from = strings.TrimSpace(from)
+		to = strings.TrimSpace(to)
+		if from == "" || to == "" || from == to {
+			return
+		}
+		key := from + "\x00" + to + "\x00" + strings.TrimSpace(condition)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		if strings.TrimSpace(id) == "" {
+			id = fmt.Sprintf("edge-%d", len(result)+1)
+		}
+		result = append(result, model.WorkflowEdge{ID: id, From: from, To: to, Condition: strings.TrimSpace(condition)})
+	}
+
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) == nil {
+		for _, item := range items {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(item, &object) != nil {
+				continue
+			}
+			from := connectionNodeID(object, "from", "source", "sourceID", "output")
+			condition := connectionString(object, "condition", "when", "expression")
+			to := connectionNodeID(object, "to", "target", "targetID", "input", "node")
+			if to != "" {
+				appendEdge(connectionString(object, "id", "edgeID"), from, to, condition)
+				continue
+			}
+			for _, key := range []string{"targets", "toNodes", "destinations"} {
+				encoded, ok := object[key]
+				if !ok {
+					continue
+				}
+				var targets []json.RawMessage
+				if json.Unmarshal(encoded, &targets) != nil {
+					continue
+				}
+				for _, target := range targets {
+					appendEdge("", from, connectionNodeIDFromRaw(target), condition)
+				}
+			}
+		}
+		return result
+	}
+
+	var adjacency map[string]json.RawMessage
+	if json.Unmarshal(raw, &adjacency) != nil {
+		return result
+	}
+	for from, encoded := range adjacency {
+		var targets []json.RawMessage
+		if json.Unmarshal(encoded, &targets) != nil {
+			targets = []json.RawMessage{encoded}
+		}
+		for _, target := range targets {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(target, &object) == nil && object != nil {
+				condition := connectionString(object, "condition", "when", "expression")
+				appendEdge(connectionString(object, "id", "edgeID"), from, connectionNodeID(object, "to", "target", "targetID", "node", "input"), condition)
+				continue
+			}
+			appendEdge("", from, connectionNodeIDFromRaw(target), "")
+		}
+	}
+	return result
+}
+
+func connectionString(object map[string]json.RawMessage, keys ...string) string {
+	for _, key := range keys {
+		if encoded, ok := object[key]; ok {
+			var value string
+			if json.Unmarshal(encoded, &value) == nil {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+	return ""
+}
+
+func connectionNodeID(object map[string]json.RawMessage, keys ...string) string {
+	for _, key := range keys {
+		if encoded, ok := object[key]; ok {
+			if value := connectionNodeIDFromRaw(encoded); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func connectionNodeIDFromRaw(raw json.RawMessage) string {
+	var value string
+	if json.Unmarshal(raw, &value) == nil {
+		return strings.TrimSpace(value)
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil {
+		return ""
+	}
+	return connectionString(object, "id", "node", "nodeID", "name", "to", "target")
 }
 
 func NormalizeProposal(proposal model.BuilderProposal, project model.Project, catalog Catalog) (model.BuilderProposal, error) {
 	proposal.SchemaVersion = 1
 	proposal.Summary = boundedText(proposal.Summary, "Proposed Centurion workspace", 1200)
+	proposal.ExecutionBrief = boundedText(proposal.ExecutionBrief, "", MaxExecutionBriefBytes)
+	if proposal.Workflow != nil {
+		proposal.Workflow.ExecutionBrief = boundedText(proposal.Workflow.ExecutionBrief, proposal.ExecutionBrief, MaxExecutionBriefBytes)
+	}
 	if proposal.Summary == "" {
 		return model.BuilderProposal{}, errors.New("builder proposal summary is required")
 	}
@@ -146,6 +500,7 @@ func NormalizeProposal(proposal model.BuilderProposal, project model.Project, ca
 		agent.MaxDurationSeconds = clampInt(agent.MaxDurationSeconds, 1800, 30, 86400)
 		agent.MaxTurns = clampInt(agent.MaxTurns, 12, 1, 50)
 		agent.MaxAttempts = clampInt(agent.MaxAttempts, 2, 1, 5)
+		agent.AvatarID = normalizeAgentAvatar(agent.AvatarID, agent.Role, agent.Instructions)
 		requestedModelID := strings.TrimSpace(agent.ModelID)
 		agent.ModelID = normalizeModelID(requestedModelID, allowedModels)
 		if agent.ModelID == "" && requestedModelID != "" {
@@ -157,6 +512,7 @@ func NormalizeProposal(proposal model.BuilderProposal, project model.Project, ca
 	}
 
 	if proposal.Workflow != nil {
+		completeWorkflowAgentReferences(&proposal, agentIDs, project.Folders, &proposal.Notes)
 		if err := normalizeWorkflow(proposal.Workflow, agentIDs, firstAgentID, project.Folders, allowedTools, &proposal.Notes); err != nil {
 			return model.BuilderProposal{}, err
 		}
@@ -164,19 +520,113 @@ func NormalizeProposal(proposal model.BuilderProposal, project model.Project, ca
 	return proposal, nil
 }
 
-// ApplyAgentDefaults makes the model used to draft the proposal the default
-// for every generated agent. An explicit, catalog-valid model returned for an
-// individual agent is preserved.
-func ApplyAgentDefaults(proposal model.BuilderProposal, modelID, reasoningEffort string) model.BuilderProposal {
+// completeWorkflowAgentReferences repairs the common case where the model
+// gives a workflow node a suffixed variant of an agent ID, or forgets to emit
+// the corresponding draft agent. The generated placeholder is deliberately
+// approval-gated and remains visible in the reviewable proposal.
+func completeWorkflowAgentReferences(proposal *model.BuilderProposal, agentIDs map[string]struct{}, projectRoots []string, notes *[]string) {
+	if proposal == nil || proposal.Workflow == nil {
+		return
+	}
+	for index := range proposal.Workflow.Nodes {
+		node := &proposal.Workflow.Nodes[index]
+		if strings.ToLower(strings.TrimSpace(node.Type)) != "agent" {
+			continue
+		}
+		reference := strings.TrimSpace(node.AgentID)
+		if reference == "" {
+			continue
+		}
+		if resolved := resolveAgentReference(reference, agentIDs); resolved != "" {
+			if resolved != reference {
+				*notes = addNote(*notes, fmt.Sprintf("Workflow node %q was mapped from missing agent reference %q to %q.", node.ID, reference, resolved))
+				node.AgentID = resolved
+			}
+			continue
+		}
+
+		generatedID := normalizeID(reference, fmt.Sprintf("agent-workflow-%d", len(proposal.Agents)+1))
+		if _, exists := agentIDs[generatedID]; exists {
+			generatedID = fmt.Sprintf("%s-%d", generatedID, len(proposal.Agents)+1)
+		}
+		proposal.Agents = append(proposal.Agents, model.BuilderAgentDraft{
+			TemporaryID:        generatedID,
+			Name:               fmt.Sprintf("Workflow agent %d", len(proposal.Agents)+1),
+			Role:               "Workflow specialist",
+			Instructions:       "Complete the responsibilities implied by the workflow node, stay inside the configured workspace, and report a verifiable result.",
+			WorkspaceRoots:     append([]string(nil), projectRoots...),
+			ApprovalProfile:    "on_request",
+			RoomID:             "workshop",
+			AvatarID:           "operator",
+			MaxDurationSeconds: 1800,
+			MaxTurns:           12,
+			MaxAttempts:        2,
+		})
+		agentIDs[generatedID] = struct{}{}
+		node.AgentID = generatedID
+		*notes = addNote(*notes, fmt.Sprintf("Workflow node %q referenced missing agent %q; Centurion added an approval-gated placeholder for review.", node.ID, reference))
+	}
+}
+
+func resolveAgentReference(reference string, agentIDs map[string]struct{}) string {
+	reference = strings.TrimSpace(reference)
+	if reference == "" {
+		return ""
+	}
+	if _, exists := agentIDs[reference]; exists {
+		return reference
+	}
+	lowerReference := strings.ToLower(reference)
+	for candidate := range agentIDs {
+		if strings.ToLower(candidate) == lowerReference {
+			return candidate
+		}
+	}
+	resolved := ""
+	for candidate := range agentIDs {
+		lowerCandidate := strings.ToLower(strings.TrimSpace(candidate))
+		if lowerCandidate == "" || len(lowerCandidate) <= len(resolved) {
+			continue
+		}
+		if strings.HasPrefix(lowerReference, lowerCandidate+"-") || strings.HasPrefix(lowerReference, lowerCandidate+"_") {
+			resolved = candidate
+		}
+	}
+	return resolved
+}
+
+// ApplyAgentModelSelection makes the application's model selection
+// authoritative for every generated agent. This prevents the Builder model
+// from silently choosing a different model or reasoning effort per agent.
+// Empty values intentionally clear model metadata so runtime agents inherit
+// the user's Codex configuration.
+func ApplyAgentModelSelection(proposal model.BuilderProposal, modelID, reasoningEffort string) model.BuilderProposal {
 	modelID = strings.TrimSpace(modelID)
 	reasoningEffort = strings.TrimSpace(reasoningEffort)
 	for index := range proposal.Agents {
-		if strings.TrimSpace(proposal.Agents[index].ModelID) == "" {
-			proposal.Agents[index].ModelID = modelID
-		}
-		if strings.TrimSpace(proposal.Agents[index].ReasoningEffort) == "" {
-			proposal.Agents[index].ReasoningEffort = reasoningEffort
-		}
+		proposal.Agents[index].ModelID = modelID
+		proposal.Agents[index].ReasoningEffort = reasoningEffort
+	}
+	return proposal
+}
+
+// NormalizeSubagentApprovalProfile converts the UI choice into the only two
+// approval modes supported by generated agents. Empty input is intentionally
+// conservative because BuilderRequest can also be called by older clients.
+func NormalizeSubagentApprovalProfile(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "on_request"
+	}
+	return normalizeApprovalProfile(value)
+}
+
+// ApplySubagentPermissions makes the user's Builder setting authoritative for
+// every generated profile. The model may suggest permissions in its JSON, but
+// it must not silently elevate or downgrade the explicit UI choice.
+func ApplySubagentPermissions(proposal model.BuilderProposal, value string) model.BuilderProposal {
+	profile := NormalizeSubagentApprovalProfile(value)
+	for index := range proposal.Agents {
+		proposal.Agents[index].ApprovalProfile = profile
 	}
 	return proposal
 }
@@ -197,6 +647,7 @@ func normalizeWorkflow(workflow *model.WorkflowDefinition, agentIDs map[string]s
 	workflow.ID = normalizeID(workflow.ID, "workflow-draft")
 	workflow.Name = boundedText(workflow.Name, "Agent workflow", 160)
 	workflow.Description = boundedText(workflow.Description, "", 1200)
+	workflow.ExecutionBrief = boundedText(workflow.ExecutionBrief, "", MaxExecutionBriefBytes)
 	workflow.Version = 1
 	workflow.GlobalLimits.MaxDurationSeconds = clampInt(workflow.GlobalLimits.MaxDurationSeconds, 3600, 30, 7*24*3600)
 	workflow.GlobalLimits.MaxParallel = clampInt(workflow.GlobalLimits.MaxParallel, 2, 1, 16)
@@ -218,6 +669,7 @@ func normalizeWorkflow(workflow *model.WorkflowDefinition, agentIDs map[string]s
 			return fmt.Errorf("unsupported builder node type %q", node.Type)
 		}
 		node.Label = boundedText(node.Label, strings.Title(node.Type), 160)
+		node.Prompt = boundedText(node.Prompt, "", 8*1024)
 		node.TimeoutSeconds = clampInt(node.TimeoutSeconds, 0, 0, 86400)
 		node.Retry.MaxAttempts = clampInt(node.Retry.MaxAttempts, 1, 1, 5)
 		node.Retry.BackoffSeconds = clampInt(node.Retry.BackoffSeconds, 0, 0, 300)
@@ -260,6 +712,10 @@ func normalizeWorkflow(workflow *model.WorkflowDefinition, agentIDs map[string]s
 	if _, ok := nodeIDs[workflow.EntryNodeID]; !ok {
 		return fmt.Errorf("workflow entryNodeID %q does not reference a node", workflow.EntryNodeID)
 	}
+	if len(workflow.Nodes) > 1 && len(workflow.Edges) == 0 {
+		workflow.Edges = sequentialWorkflowEdges(workflow.Nodes)
+		*notes = addNote(*notes, "The Builder returned multiple steps without connections; Centurion linked them in declared order. Review the route before running.")
+	}
 
 	edges := make([]model.WorkflowEdge, 0, len(workflow.Edges))
 	edgeIDs := make(map[string]struct{}, len(workflow.Edges))
@@ -290,13 +746,30 @@ func normalizeWorkflow(workflow *model.WorkflowDefinition, agentIDs map[string]s
 	return nil
 }
 
+func sequentialWorkflowEdges(nodes []model.WorkflowNode) []model.WorkflowEdge {
+	if len(nodes) < 2 {
+		return nil
+	}
+	edges := make([]model.WorkflowEdge, 0, len(nodes)-1)
+	for index := 0; index < len(nodes)-1; index++ {
+		edges = append(edges, model.WorkflowEdge{
+			ID:   fmt.Sprintf("edge-auto-%d", index+1),
+			From: nodes[index].ID,
+			To:   nodes[index+1].ID,
+		})
+	}
+	return edges
+}
+
 func safeNodeConfig(config map[string]any, nodeIDs map[string]struct{}) map[string]any {
 	result := make(map[string]any)
-	if value, ok := config["onExhausted"].(string); ok {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			if _, exists := nodeIDs[value]; exists {
-				result["onExhausted"] = value
+	for _, key := range []string{"onExhausted", "fallbackNodeID"} {
+		if value, ok := config[key].(string); ok {
+			value = strings.TrimSpace(value)
+			if value != "" {
+				if _, exists := nodeIDs[value]; exists {
+					result[key] = value
+				}
 			}
 		}
 	}
@@ -429,6 +902,26 @@ func normalizeApprovalProfile(value string) string {
 	default:
 		return "on_request"
 	}
+}
+
+func normalizeAgentAvatar(value, role, instructions string) string {
+	context := strings.ToLower(strings.TrimSpace(role + " " + instructions))
+	switch {
+	case strings.Contains(context, "research"), strings.Contains(context, "analys"), strings.Contains(context, "evidence"), strings.Contains(context, "investigat"):
+		return "researcher"
+	case strings.Contains(context, "review"), strings.Contains(context, "quality"), strings.Contains(context, "security"), strings.Contains(context, "audit"), strings.Contains(context, "test"):
+		return "reviewer"
+	case strings.Contains(context, "supervis"), strings.Contains(context, "tech lead"), strings.Contains(context, "team lead"), strings.Contains(context, "architect"), strings.Contains(context, "orchestrat"), strings.Contains(context, "coordinat"), strings.Contains(context, "planner"):
+		return "supervisor"
+	}
+
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "supervisor", "builder", "researcher", "reviewer":
+		return strings.ToLower(strings.TrimSpace(value))
+	case "architect":
+		return "supervisor"
+	}
+	return "builder"
 }
 
 func normalizeRoom(value string) string {

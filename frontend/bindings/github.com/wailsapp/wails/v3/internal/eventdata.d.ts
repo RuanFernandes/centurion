@@ -15,6 +15,7 @@ declare module "@wailsio/runtime" {
             "approval.requested": model$0.ApprovalRequest;
             "approval.resolved": model$0.ApprovalDecision;
             "auth.updated": model$0.AuthState;
+            "builder.activity": model$0.BuilderActivityEvent;
             "codex.notification": model$0.CodexNotification;
             "mcp.status": model$0.MCPStatusEvent;
             "models.updated": model$0.ModelsUpdatedEvent;

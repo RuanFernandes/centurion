@@ -14,6 +14,7 @@ const (
 	RunStatusPaused          = "paused"
 	RunStatusWaitingApproval = "waiting_approval"
 	RunStatusCompleted       = "completed"
+	RunStatusBlocked         = "blocked"
 	RunStatusFailed          = "failed"
 	RunStatusCanceled        = "canceled"
 	RunStatusInterrupted     = "interrupted"
@@ -116,6 +117,7 @@ type AgentProfile struct {
 	ApprovalProfile    string   `json:"approvalProfile"`
 	RoomID             string   `json:"roomID"`
 	AvatarID           string   `json:"avatarID"`
+	SpriteID           string   `json:"spriteID"`
 	VisualState        string   `json:"visualState"`
 	MaxDurationSeconds int      `json:"maxDurationSeconds"`
 	MaxTurns           int      `json:"maxTurns"`
@@ -125,21 +127,25 @@ type AgentProfile struct {
 	UpdatedAt          string   `json:"updatedAt"`
 }
 
-// BuilderRequest is the small, user-authored input sent to the in-app Codex
-// configuration builder. ThreadID is kept in memory by AppService so a
-// follow-up stays in the same builder conversation without exposing arbitrary
-// Codex threads to the frontend.
+// BuilderRequest is the user-authored input sent to the in-app Codex
+// configuration builder. Handoff marks the controlled Planner-to-Builder
+// transition, which is allowed a larger bounded payload than a direct build
+// request because it carries a compacted planning transcript.
 type BuilderRequest struct {
-	Prompt          string `json:"prompt"`
-	ProjectID       string `json:"projectID,omitempty"`
-	ThreadID        string `json:"threadID,omitempty"`
-	ModelID         string `json:"modelID,omitempty"`
-	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	Prompt                  string `json:"prompt"`
+	ProjectID               string `json:"projectID,omitempty"`
+	ThreadID                string `json:"threadID,omitempty"`
+	ModelID                 string `json:"modelID,omitempty"`
+	ReasoningEffort         string `json:"reasoningEffort,omitempty"`
+	SubagentApprovalProfile string `json:"subagentApprovalProfile,omitempty"`
+	Handoff                 bool   `json:"handoff,omitempty"`
 }
 
 // PlanningRequest is a user-authored message sent to the read-only planning
-// room. The selected agent contributes its identity and model, but the
-// service strips workspace and tool access before opening the Codex turn.
+// room. The selected agent contributes its identity and instructions; an
+// empty model selection delegates model and automatic-effort resolution to
+// the user's Codex App Server configuration. Workspace and tool access are
+// always stripped before opening the Codex turn.
 type PlanningRequest struct {
 	Prompt          string `json:"prompt"`
 	ProjectID       string `json:"projectID,omitempty"`
@@ -177,17 +183,42 @@ type BuilderAgentDraft struct {
 // BuilderProposal is returned by Codex and remains inert until explicitly
 // applied by the user. Workflow references point to BuilderAgentDraft IDs.
 type BuilderProposal struct {
-	SchemaVersion int                 `json:"schemaVersion"`
-	Summary       string              `json:"summary"`
-	Notes         []string            `json:"notes,omitempty"`
-	Agents        []BuilderAgentDraft `json:"agents"`
-	Workflow      *WorkflowDefinition `json:"workflow,omitempty"`
+	SchemaVersion  int                 `json:"schemaVersion"`
+	Summary        string              `json:"summary"`
+	ExecutionBrief string              `json:"executionBrief,omitempty"`
+	Notes          []string            `json:"notes,omitempty"`
+	Agents         []BuilderAgentDraft `json:"agents"`
+	Workflow       *WorkflowDefinition `json:"workflow,omitempty"`
 }
 
 type BuilderResponse struct {
 	ThreadID string          `json:"threadID"`
 	Reply    string          `json:"reply"`
 	Proposal BuilderProposal `json:"proposal"`
+}
+
+// BuilderStatus lets the UI reconnect to a planning or build request after
+// navigation. The final response is retained in memory until the next
+// request, while private notification payloads and reasoning text are never
+// stored here.
+type BuilderStatus struct {
+	SchemaVersion    int               `json:"schemaVersion"`
+	Timestamp        string            `json:"timestamp"`
+	Sequence         int64             `json:"sequence"`
+	Source           string            `json:"source"`
+	RequestID        string            `json:"requestID"`
+	ProjectID        string            `json:"projectID,omitempty"`
+	Scope            string            `json:"scope"`
+	State            string            `json:"state"`
+	Activity         string            `json:"activity"`
+	Detail           string            `json:"detail,omitempty"`
+	ThreadID         string            `json:"threadID,omitempty"`
+	TurnID           string            `json:"turnID,omitempty"`
+	StartedAt        string            `json:"startedAt"`
+	UpdatedAt        string            `json:"updatedAt"`
+	Error            string            `json:"error,omitempty"`
+	PlanningResponse *PlanningResponse `json:"planningResponse,omitempty"`
+	BuilderResponse  *BuilderResponse  `json:"builderResponse,omitempty"`
 }
 
 type BuilderApplyRequest struct {
@@ -209,6 +240,26 @@ type Project struct {
 	CreatedAt    string   `json:"createdAt"`
 	UpdatedAt    string   `json:"updatedAt"`
 	LastOpenedAt string   `json:"lastOpenedAt,omitempty"`
+}
+
+type LearnSystemRequest struct {
+	ProjectID       string `json:"projectID,omitempty"`
+	ModelID         string `json:"modelID,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+}
+
+type LearnSystemResult struct {
+	ProjectID       string   `json:"projectID"`
+	Status          string   `json:"status"`
+	PrimaryFolder   string   `json:"primaryFolder"`
+	DocsPath        string   `json:"docsPath"`
+	DocsFiles       []string `json:"docsFiles"`
+	MissingFiles    []string `json:"missingFiles,omitempty"`
+	ModelID         string   `json:"modelID,omitempty"`
+	ReasoningEffort string   `json:"reasoningEffort,omitempty"`
+	ThreadID        string   `json:"threadID,omitempty"`
+	Summary         string   `json:"summary,omitempty"`
+	DurationMS      int64    `json:"durationMs"`
 }
 
 type ProjectSnapshot struct {
@@ -252,6 +303,7 @@ type WorkflowNode struct {
 	Type           string         `json:"type"`
 	Label          string         `json:"label"`
 	AgentID        string         `json:"agentID,omitempty"`
+	Prompt         string         `json:"prompt,omitempty"`
 	Condition      string         `json:"condition,omitempty"`
 	ToolName       string         `json:"toolName,omitempty"`
 	ArtifactPath   string         `json:"artifactPath,omitempty"`
@@ -269,18 +321,19 @@ type WorkflowEdge struct {
 }
 
 type WorkflowDefinition struct {
-	ID           string         `json:"id"`
-	ProjectID    string         `json:"projectID,omitempty"`
-	Name         string         `json:"name"`
-	Version      int            `json:"version"`
-	Description  string         `json:"description,omitempty"`
-	EntryNodeID  string         `json:"entryNodeID"`
-	Nodes        []WorkflowNode `json:"nodes"`
-	Edges        []WorkflowEdge `json:"edges"`
-	GlobalLimits WorkflowLimits `json:"globalLimits"`
-	ErrorPolicy  string         `json:"errorPolicy"`
-	CreatedAt    string         `json:"createdAt"`
-	UpdatedAt    string         `json:"updatedAt"`
+	ID             string         `json:"id"`
+	ProjectID      string         `json:"projectID,omitempty"`
+	Name           string         `json:"name"`
+	Version        int            `json:"version"`
+	Description    string         `json:"description,omitempty"`
+	ExecutionBrief string         `json:"executionBrief,omitempty"`
+	EntryNodeID    string         `json:"entryNodeID"`
+	Nodes          []WorkflowNode `json:"nodes"`
+	Edges          []WorkflowEdge `json:"edges"`
+	GlobalLimits   WorkflowLimits `json:"globalLimits"`
+	ErrorPolicy    string         `json:"errorPolicy"`
+	CreatedAt      string         `json:"createdAt"`
+	UpdatedAt      string         `json:"updatedAt"`
 }
 
 type ValidationIssue struct {
@@ -312,6 +365,21 @@ type Run struct {
 	PromptTokensUsed  int            `json:"promptTokensUsed"`
 	PromptTokenBudget int            `json:"promptTokenBudget"`
 	OutputBytes       int            `json:"outputBytes"`
+}
+
+// RunStep is the durable checkpoint for one workflow node. It is exposed to
+// the Office inspector so users can understand what each agent actually did.
+type RunStep struct {
+	RunID       string         `json:"runID"`
+	NodeID      string         `json:"nodeID"`
+	Status      string         `json:"status"`
+	Attempt     int            `json:"attempt"`
+	ThreadID    string         `json:"threadID,omitempty"`
+	TurnID      string         `json:"turnID,omitempty"`
+	Output      map[string]any `json:"output,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	StartedAt   string         `json:"startedAt,omitempty"`
+	CompletedAt string         `json:"completedAt,omitempty"`
 }
 
 type RunFilter struct {
@@ -472,6 +540,22 @@ type CodexNotification struct {
 	Source        string         `json:"source"`
 	Method        string         `json:"method"`
 	Params        map[string]any `json:"params,omitempty"`
+}
+
+// BuilderActivityEvent is a deliberately summarized view of a planner or
+// builder turn. It reports an operational phase, never raw notification
+// parameters or private model reasoning.
+type BuilderActivityEvent struct {
+	SchemaVersion int    `json:"schemaVersion"`
+	Timestamp     string `json:"timestamp"`
+	Sequence      int64  `json:"sequence"`
+	Source        string `json:"source"`
+	Scope         string `json:"scope"`
+	ThreadID      string `json:"threadID,omitempty"`
+	TurnID        string `json:"turnID,omitempty"`
+	State         string `json:"state"`
+	Activity      string `json:"activity"`
+	Detail        string `json:"detail,omitempty"`
 }
 
 type ModelsUpdatedEvent struct {

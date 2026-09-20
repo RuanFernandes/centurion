@@ -51,7 +51,7 @@ func main() {
 			}
 			sandbox, _ := params["sandbox"].(string)
 			switch sandbox {
-			case "read-only", "workspace-write", "danger-full-access":
+			case "readOnly", "workspaceWrite", "dangerFullAccess":
 			default:
 				respondError(request.ID, -32600, fmt.Sprintf("invalid sandbox %q", sandbox))
 				continue

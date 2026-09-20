@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/RuanFernandes/centurion/internal/model"
@@ -31,6 +32,13 @@ func TestStorePersistsAgentsRunsAndOrderedEvents(t *testing.T) {
 	if err := dataStore.CreateRun(ctx, run); err != nil {
 		t.Fatal(err)
 	}
+	if err := dataStore.UpsertRunStep(ctx, RunStep{RunID: run.ID, NodeID: "agent-step", Status: "completed", Attempt: 1, ThreadID: "thread-1", TurnID: "turn-1", Output: map[string]any{"ok": true}, StartedAt: run.StartedAt, CompletedAt: run.UpdatedAt}); err != nil {
+		t.Fatal(err)
+	}
+	steps, err := dataStore.ListRunSteps(ctx, run.ID)
+	if err != nil || len(steps) != 1 || steps[0].Output["ok"] != true {
+		t.Fatalf("run step round-trip failed: %#v, %v", steps, err)
+	}
 	first, err := dataStore.AppendRunEvent(ctx, model.RunEvent{RunID: run.ID, Type: "one", Source: "test", Level: "info", Message: "first"})
 	if err != nil {
 		t.Fatal(err)
@@ -45,6 +53,71 @@ func TestStorePersistsAgentsRunsAndOrderedEvents(t *testing.T) {
 	events, err := dataStore.ListRunEvents(ctx, run.ID, 0)
 	if err != nil || len(events) != 2 || events[1].Message != "second" {
 		t.Fatalf("event round-trip failed: %#v, %v", events, err)
+	}
+}
+
+func TestStoreSerializesConcurrentRunEventSequences(t *testing.T) {
+	dataStore, err := Open(filepath.Join(t.TempDir(), "centurion.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	ctx := context.Background()
+	run := model.Run{ID: "run-concurrent-events", WorkflowID: "workflow-studio-brief", Status: model.RunStatusRunning, StartedAt: now(), UpdatedAt: now()}
+	if err := dataStore.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	const eventCount = 64
+	errorsCh := make(chan error, eventCount)
+	var waitGroup sync.WaitGroup
+	for index := 0; index < eventCount; index++ {
+		waitGroup.Add(1)
+		go func(index int) {
+			defer waitGroup.Done()
+			_, err := dataStore.AppendRunEvent(ctx, model.RunEvent{RunID: run.ID, Type: "parallel", Source: "test", Level: "info", Message: string(rune('a' + index%26))})
+			errorsCh <- err
+		}(index)
+	}
+	waitGroup.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		if err != nil {
+			t.Fatalf("concurrent event append failed: %v", err)
+		}
+	}
+	events, err := dataStore.ListRunEvents(ctx, run.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != eventCount {
+		t.Fatalf("expected %d events, got %d", eventCount, len(events))
+	}
+	for index, event := range events {
+		want := int64(index + 1)
+		if event.Sequence != want {
+			t.Fatalf("event %d has sequence %d, want %d", index, event.Sequence, want)
+		}
+	}
+}
+
+func TestAgentListJSONNormalizesEmptyValues(t *testing.T) {
+	encoded, err := agentListJSON(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if encoded != "[]" {
+		t.Fatalf("expected an empty JSON array, got %q", encoded)
+	}
+
+	for _, raw := range []string{"", "null", "{}"} {
+		decoded, err := decodeAgentList(raw)
+		if err != nil {
+			t.Fatalf("decode %q: %v", raw, err)
+		}
+		if decoded == nil || len(decoded) != 0 {
+			t.Fatalf("decode %q returned %#v", raw, decoded)
+		}
 	}
 }
 
